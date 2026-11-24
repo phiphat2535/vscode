@@ -28,6 +28,7 @@ class TestMcpHostDelegate extends Disposable implements IMcpHostDelegate {
 	private readonly _transport: TestMcpMessageTransport;
 
 	priority = 0;
+	resolvePolicyVariables = async () => ({});
 
 	constructor() {
 		super();
@@ -36,6 +37,10 @@ class TestMcpHostDelegate extends Disposable implements IMcpHostDelegate {
 
 
 	substituteVariables(serverDefinition: McpServerDefinition, launch: McpServerLaunch): Promise<McpServerLaunch> {
+		return Promise.resolve(launch);
+	}
+
+	expandEnvironmentVariables(serverDefinition: McpServerDefinition, launch: McpServerLaunch): Promise<McpServerLaunch> {
 		return Promise.resolve(launch);
 	}
 
@@ -64,11 +69,13 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 	let transport: TestMcpMessageTransport;
 	let handler: McpServerRequestHandler;
 	let cts: CancellationTokenSource;
+	let elicitationRequests: MCP.ElicitRequest['params'][];
 
 	setup(async () => {
 		delegate = store.add(new TestMcpHostDelegate());
 		transport = delegate.getTransport();
 		cts = store.add(new CancellationTokenSource());
+		elicitationRequests = [];
 
 		// Setup test services
 		const services = new ServiceCollection(
@@ -87,9 +94,17 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 			.createLogger('mcpServerTest', { hidden: true, name: 'MCP Test' }));
 
 		// Start the handler creation
-		const handlerPromise = McpServerRequestHandler.create(instantiationService, { logger, launch: transport, taskManager: store.add(new McpTaskManager()) }, cts.token);
+		const createPromise = McpServerRequestHandler.create(instantiationService, {
+			logger,
+			launch: transport,
+			taskManager: store.add(new McpTaskManager()),
+			elicitationRequestHandler: async request => {
+				elicitationRequests.push(request);
+				return { action: 'cancel' };
+			},
+		}, cts.token);
 
-		handler = await handlerPromise;
+		handler = await createPromise;
 		store.add(handler);
 	});
 
@@ -253,6 +268,50 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		assert.strictEqual((rootsResponse.result as MCP.ListRootsResult).roots[0].uri, 'file:///test/root1');
 	});
 
+	test('should reject elicitation requests with non-string messages', async () => {
+		const maliciousMessage = {
+			_nodes: [{ label: 'Open details', href: 'command:workbench.action.terminal.sendSequence?{"text":"echo pwned"}' }],
+		} as unknown as string;
+		const requestIds = [102, 103];
+
+		transport.simulateReceiveMessage({
+			jsonrpc: MCP.JSONRPC_VERSION,
+			id: requestIds[0],
+			method: 'elicitation/create',
+			params: {
+				mode: 'form',
+				message: maliciousMessage,
+				requestedSchema: { type: 'object', properties: {} },
+			},
+		});
+		transport.simulateReceiveMessage({
+			jsonrpc: MCP.JSONRPC_VERSION,
+			id: requestIds[1],
+			method: 'elicitation/create',
+			params: {
+				mode: 'url',
+				message: maliciousMessage,
+				elicitationId: 'test',
+				url: 'https://example.com',
+				task: {},
+			},
+		});
+		await new Promise(resolve => setTimeout(resolve, 0));
+
+		const responses = transport.getSentMessages().filter((message): message is MCP.JSONRPCErrorResponse =>
+			'id' in message && requestIds.includes(message.id as number) && 'error' in message
+		);
+		assert.deepStrictEqual(responses.map(response => [response.id, response.error.code]), [
+			[requestIds[0], MCP.INVALID_PARAMS],
+			[requestIds[1], MCP.INVALID_PARAMS],
+		]);
+		assert.deepStrictEqual(responses.map(response => response.error.message), [
+			'Elicitation message must be a string',
+			'Elicitation message must be a string',
+		]);
+		assert.strictEqual(elicitationRequests.length, 0);
+	});
+
 	test('should handle server notifications', async () => {
 		let progressNotificationReceived = false;
 		store.add(handler.onDidReceiveProgressNotification(notification => {
@@ -380,6 +439,34 @@ suite('Workbench - MCP - ServerRequestHandler', () => {
 		} catch (e) {
 			assert.strictEqual(e.name, 'Canceled');
 		}
+	});
+
+	test('callTool forwards _meta.traceparent to the JSON-RPC payload (MCP SEP-414)', async () => {
+		const traceparent = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01';
+		const tracestate = 'rojo=00f067aa0ba902b7';
+
+		const callPromise = handler.callTool({
+			name: 'echo',
+			arguments: { hello: 'world' },
+			_meta: { traceparent, tracestate, progressToken: 'tok-1' },
+		});
+
+		const sentMessages = transport.getSentMessages();
+		const callRequest = sentMessages[2] as MCP.JSONRPCRequest & MCP.CallToolRequest;
+		assert.strictEqual(callRequest.method, 'tools/call');
+		assert.deepStrictEqual(callRequest.params._meta, {
+			traceparent,
+			tracestate,
+			progressToken: 'tok-1',
+		});
+
+		transport.simulateReceiveMessage({
+			jsonrpc: MCP.JSONRPC_VERSION,
+			id: callRequest.id,
+			result: { content: [] },
+		});
+
+		await callPromise;
 	});
 });
 

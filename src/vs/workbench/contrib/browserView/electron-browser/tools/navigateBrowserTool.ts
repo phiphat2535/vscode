@@ -7,14 +7,19 @@ import type { CancellationToken } from '../../../../../base/common/cancellation.
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { localize } from '../../../../../nls.js';
+import { IBrowserViewNetwork, remoteUrlToFileUrl } from '../../../../../platform/browserView/common/browserView.js';
 import { IPlaywrightService } from '../../../../../platform/browserView/common/playwrightService.js';
 import { ToolDataSource, type CountTokensCallback, type IPreparedToolInvocation, type IToolData, type IToolImpl, type IToolInvocation, type IToolInvocationPreparationContext, type IToolResult, type ToolProgress } from '../../../chat/common/tools/languageModelToolsService.js';
-import { createBrowserPageLink, errorResult, playwrightInvoke } from './browserToolHelpers.js';
+import { IAgentNetworkFilterService } from '../../../../../platform/networkFilter/common/networkFilterService.js';
+import { createBrowserPageLink, errorResult, getBrowserNetworkPolicyError, getBrowserPageResourceNavigationError, getExternalTunnelNetworkPolicyError, getSessionId, playwrightInvoke, remoteUrlRewriteNotice, rewriteRemoteLocalhostUrl, getSessionIdForResource } from './browserToolHelpers.js';
+import { BrowserChatToolReferenceName } from '../../../../../platform/browserView/common/browserChatToolReferenceNames.js';
+import { IBrowserViewWorkbenchService } from '../../common/browserView.js';
+import { IRemoteExplorerService } from '../../../../services/remote/common/remoteExplorerService.js';
 import { OpenPageToolId } from './openBrowserTool.js';
 
 export const NavigateBrowserToolData: IToolData = {
 	id: 'navigate_page',
-	toolReferenceName: 'navigatePage',
+	toolReferenceName: BrowserChatToolReferenceName.NavigatePage,
 	displayName: localize('navigateBrowserTool.displayName', 'Navigate Page'),
 	userDescription: localize('navigateBrowserTool.userDescription', 'Navigate or reload a browser page'),
 	modelDescription: 'Navigate a browser page by URL, history, or reload.',
@@ -50,6 +55,9 @@ interface INavigateBrowserToolParams {
 export class NavigateBrowserTool implements IToolImpl {
 	constructor(
 		@IPlaywrightService private readonly playwrightService: IPlaywrightService,
+		@IAgentNetworkFilterService private readonly agentNetworkFilterService: IAgentNetworkFilterService,
+		@IBrowserViewWorkbenchService private readonly browserViewService: IBrowserViewWorkbenchService,
+		@IRemoteExplorerService private readonly remoteExplorerService: IRemoteExplorerService,
 	) { }
 
 	async prepareToolInvocation(context: IToolInvocationPreparationContext, _token: CancellationToken): Promise<IPreparedToolInvocation | undefined> {
@@ -83,6 +91,20 @@ export class NavigateBrowserTool implements IToolImpl {
 					throw new Error('You must provide a complete, valid URL.');
 				}
 
+				params.url = parsed.href;
+
+				const resourceNavigationError = this.getResourceNavigationError(params.pageId, params.url);
+				if (resourceNavigationError) {
+					throw new Error(resourceNavigationError);
+				}
+
+				const pageNetwork = this.getPageNetwork(params.pageId, getSessionIdForResource(context.chatSessionResource));
+				// A resource of the page's remote is loaded as a `file:` URL, so the policy applies to that.
+				const networkPolicyError = getBrowserNetworkPolicyError(remoteUrlToFileUrl(pageNetwork, params.url), this.agentNetworkFilterService);
+				if (networkPolicyError) {
+					throw new Error(networkPolicyError);
+				}
+
 				return {
 					invocationMessage: new MarkdownString(localize('browser.navigate.invocation', "Navigating to {0} in {1}", parsed.href, link)),
 					pastTenseMessage: new MarkdownString(localize('browser.navigate.past', "Navigated to {0} in {1}", parsed.href, link)),
@@ -98,6 +120,7 @@ export class NavigateBrowserTool implements IToolImpl {
 
 	async invoke(invocation: IToolInvocation, _countTokens: CountTokensCallback, _progress: ToolProgress, _token: CancellationToken): Promise<IToolResult> {
 		const params = invocation.parameters as INavigateBrowserToolParams;
+		const sessionId = getSessionId(invocation);
 
 		if (!params.pageId) {
 			return errorResult(`No page ID provided. Use '${OpenPageToolId}' first.`);
@@ -105,16 +128,51 @@ export class NavigateBrowserTool implements IToolImpl {
 
 		switch (params.type) {
 			case 'reload':
-				return playwrightInvoke(this.playwrightService, params.pageId, (page) => page.reload({ waitUntil: 'domcontentloaded' }));
+				return playwrightInvoke(this.playwrightService, sessionId, params.pageId, (page) => page.reload({ waitUntil: 'domcontentloaded' }));
 			case 'back':
-				return playwrightInvoke(this.playwrightService, params.pageId, (page) => page.goBack({ waitUntil: 'domcontentloaded' }));
+				return playwrightInvoke(this.playwrightService, sessionId, params.pageId, (page) => page.goBack({ waitUntil: 'domcontentloaded' }));
 			case 'forward':
-				return playwrightInvoke(this.playwrightService, params.pageId, (page) => page.goForward({ waitUntil: 'domcontentloaded' }));
+				return playwrightInvoke(this.playwrightService, sessionId, params.pageId, (page) => page.goForward({ waitUntil: 'domcontentloaded' }));
 			default: {
-				return playwrightInvoke(this.playwrightService, params.pageId, (page, url) => {
-					return page.goto(url, { waitUntil: 'domcontentloaded' });
-				}, params.url!);
+				const network = this.getPageNetwork(params.pageId, sessionId);
+				// A resource of the page's remote is loaded as a `file:` URL, so the policy, the rewrite and the navigation use that.
+				const url = remoteUrlToFileUrl(network, params.url!);
+				const networkPolicyError = getBrowserNetworkPolicyError(url, this.agentNetworkFilterService);
+				if (networkPolicyError) {
+					return errorResult(networkPolicyError);
+				}
+
+				const resourceNavigationError = this.getResourceNavigationError(params.pageId, params.url!);
+				if (resourceNavigationError) {
+					return errorResult(resourceNavigationError);
+				}
+
+				// A page on the local network in a remote workspace runs locally and cannot reach the
+				// remote's localhost directly. Rewrite to the forwarded local address (if
+				// any) so the page can be reached. The page keeps the network it was created with.
+				const rewrite = rewriteRemoteLocalhostUrl(url, this.remoteExplorerService, !!network);
+				const tunnelPolicyError = getExternalTunnelNetworkPolicyError(rewrite, this.agentNetworkFilterService);
+				if (tunnelPolicyError) {
+					return errorResult(tunnelPolicyError);
+				}
+				const result = await playwrightInvoke(this.playwrightService, sessionId, params.pageId, (page, target) => {
+					return page.goto(target, { waitUntil: 'domcontentloaded' });
+				}, rewrite.url);
+				return rewrite.rewritten
+					? { ...result, content: [remoteUrlRewriteNotice(params.url!, rewrite.url), ...result.content] }
+					: result;
 			}
 		}
+	}
+
+	private getResourceNavigationError(pageId: string, target: string): string | undefined {
+		const editor = this.browserViewService.getKnownBrowserViews().get(pageId);
+		return getBrowserPageResourceNavigationError(editor, target);
+	}
+
+	/** The network of the page, or the one a new page of the session would use before it has a model. */
+	private getPageNetwork(pageId: string, sessionId: string): IBrowserViewNetwork | undefined {
+		const model = this.browserViewService.getKnownBrowserViews().get(pageId)?.model;
+		return model ? model.network : this.browserViewService.resolveNetwork({ type: 'agent', sessionId });
 	}
 }

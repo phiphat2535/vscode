@@ -10,15 +10,19 @@ import { mock } from '../../../../../base/test/common/mock.js';
 import { FuzzyScore } from '../../../../../base/common/filters.js';
 import { ITreeNode } from '../../../../../base/browser/ui/tree/tree.js';
 import { observableValue } from '../../../../../base/common/observable.js';
+import { Event } from '../../../../../base/common/event.js';
+import { toDisposable } from '../../../../../base/common/lifecycle.js';
 import { IMarkdownRendererService, MarkdownRendererService } from '../../../../../platform/markdown/browser/markdownRenderer.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
 import { EditorMarkdownCodeBlockRenderer } from '../../../../../editor/browser/widget/markdownRenderer/browser/editorMarkdownCodeBlockRenderer.js';
-import { AgentSessionRenderer, AgentSessionSectionRenderer, IAgentSessionRendererOptions } from '../../../../contrib/chat/browser/agentSessions/agentSessionsViewer.js';
+import { AgentSessionChatRenderer, AgentSessionRenderer, AgentSessionsListDelegate, AgentSessionSectionRenderer, IAgentSessionRendererOptions } from '../../../../contrib/chat/browser/agentSessions/agentSessionsViewer.js';
+import { IChatSessionsService } from '../../../../contrib/chat/common/chatSessionsService.js';
+import { IVoicePlaybackService } from '../../../../contrib/chat/common/voicePlaybackService.js';
 import { AgentSessionStatus, IAgentSession, AgentSessionSection, IAgentSessionSection } from '../../../../contrib/chat/browser/agentSessions/agentSessionsModel.js';
 import { AgentSessionProviders } from '../../../../contrib/chat/browser/agentSessions/agentSessions.js';
-import { AgentSessionApprovalModel, IAgentSessionApprovalInfo } from '../../../../contrib/chat/browser/agentSessions/agentSessionApprovalModel.js';
+import { AgentSessionApprovalKind, AgentSessionApprovalModel, IAgentSessionApprovalInfo } from '../../../../contrib/chat/browser/agentSessions/agentSessionApprovalModel.js';
 import { HoverPosition } from '../../../../../base/browser/ui/hover/hoverWidget.js';
 import { ComponentFixtureContext, createEditorServices, defineComponentFixture, defineThemedFixtureGroup, registerWorkbenchServices } from '../fixtureUtils.js';
 
@@ -34,6 +38,7 @@ function createMockSession(overrides: Partial<IAgentSession> & { label: string; 
 		override readonly resource = overrides.resource ?? URI.parse(`vscode-chat-session://${overrides.providerType}/session-${Math.random().toString(36).slice(2)}`);
 		override readonly label = overrides.label;
 		override readonly status = overrides.status;
+		override readonly statusKnown = overrides.statusKnown;
 		override readonly providerType = overrides.providerType;
 		override readonly providerLabel = overrides.providerLabel ?? overrides.providerType;
 		override readonly icon = overrides.icon ?? Codicon.vm;
@@ -41,6 +46,8 @@ function createMockSession(overrides: Partial<IAgentSession> & { label: string; 
 		override readonly description = overrides.description;
 		override readonly tooltip = overrides.tooltip;
 		override readonly changes = overrides.changes;
+		override readonly children = overrides.children;
+		override readonly parentSession = overrides.parentSession;
 		override readonly timing = overrides.timing ?? {
 			created: now - 60 * 60 * 1000,
 			lastRequestStarted: undefined,
@@ -48,7 +55,10 @@ function createMockSession(overrides: Partial<IAgentSession> & { label: string; 
 		};
 		override isArchived(): boolean { return overrides.isArchived?.() ?? false; }
 		override setArchived(): void { }
+		override isPinned(): boolean { return overrides.isPinned?.() ?? false; }
+		override setPinned(): void { }
 		override isRead(): boolean { return overrides.isRead?.() ?? true; }
+		override isMarkedUnread(): boolean { return false; }
 		override setRead(): void { }
 	}();
 }
@@ -88,8 +98,8 @@ function createMockApprovalModel(sessionResource: URI, info: IAgentSessionApprov
 	}();
 }
 
-function renderSessionItem(ctx: ComponentFixtureContext, session: IAgentSession, approvalModel?: AgentSessionApprovalModel): void {
-	const { container, disposableStore } = ctx;
+function createAgentSessionInstantiationService(ctx: ComponentFixtureContext) {
+	const { disposableStore } = ctx;
 
 	const instantiationService = createEditorServices(disposableStore, {
 		colorTheme: ctx.theme,
@@ -99,6 +109,21 @@ function renderSessionItem(ctx: ComponentFixtureContext, session: IAgentSession,
 			reg.defineInstance(IProductService, new class extends mock<IProductService>() {
 				override readonly urlProtocol = 'vscode';
 			}());
+			reg.defineInstance(IChatSessionsService, new class extends mock<IChatSessionsService>() {
+				override readonly onDidChangeItemsProviders = Event.None;
+				override readonly onDidChangeSessionItems = Event.None;
+				override readonly onDidChangeAvailability = Event.None;
+				override readonly onDidChangeInProgress = Event.None;
+				override async resolveChatSessionItem() { return undefined; }
+			}());
+			reg.defineInstance(IVoicePlaybackService, new class extends mock<IVoicePlaybackService>() {
+				override readonly speakingSession = observableValue<URI | undefined>('speakingSession', undefined);
+				override readonly lastPlayedVersion = observableValue<number>('lastPlayedVersion', 0);
+				override readonly pendingResponseVersion = observableValue<number>('pendingResponseVersion', 0);
+				override hasPendingResponse() { return false; }
+				override hasLastPlayed() { return false; }
+				override getLastPlayed() { return undefined; }
+			}());
 		},
 	});
 
@@ -106,6 +131,13 @@ function renderSessionItem(ctx: ComponentFixtureContext, session: IAgentSession,
 	configService.setUserConfiguration('editor', { fontFamily: 'monospace' });
 	const markdownRendererService = instantiationService.get(IMarkdownRendererService);
 	markdownRendererService.setDefaultCodeBlockRenderer(instantiationService.createInstance(EditorMarkdownCodeBlockRenderer));
+
+	return instantiationService;
+}
+
+function renderSessionItem(ctx: ComponentFixtureContext, session: IAgentSession, approvalModel?: AgentSessionApprovalModel): void {
+	const { container, disposableStore } = ctx;
+	const instantiationService = createAgentSessionInstantiationService(ctx);
 
 	const renderer = disposableStore.add(
 		instantiationService.createInstance(AgentSessionRenderer, rendererOptions, approvalModel ?? undefined, observableValue<URI | undefined>('activeSessionResource', undefined))
@@ -122,7 +154,134 @@ function renderSessionItem(ctx: ComponentFixtureContext, session: IAgentSession,
 	container.appendChild(listRow);
 
 	const template = renderer.renderTemplate(listRow);
-	renderer.renderElement(wrapAsTreeNode(session), 0, template);
+	const treeNode = wrapAsTreeNode(session);
+	renderer.renderElement(treeNode, 0, template);
+	disposableStore.add(toDisposable(() => {
+		renderer.disposeElement(treeNode, 0, template);
+		renderer.disposeTemplate(template);
+	}));
+}
+
+function renderSessionHierarchy(ctx: ComponentFixtureContext, withApproval = false): void {
+	const { container, disposableStore } = ctx;
+	const instantiationService = createAgentSessionInstantiationService(ctx);
+	const now = Date.now();
+	const parentResource = URI.parse('vscode-chat-session://local/hierarchy');
+	const child = createMockSession({
+		resource: parentResource.with({ fragment: 'peer-chat' }),
+		label: 'Add some random comment',
+		status: AgentSessionStatus.Completed,
+		statusKnown: false,
+		providerType: AgentSessionProviders.Local,
+		parentSession: {
+			resource: parentResource,
+			label: 'Hello Chat',
+		},
+		timing: {
+			created: now - 4 * 24 * 60 * 60 * 1000,
+			lastRequestStarted: now - 4 * 24 * 60 * 60 * 1000,
+			lastRequestEnded: now - 4 * 24 * 60 * 60 * 1000 + 30 * 1000,
+		},
+	});
+	const approvalModel = withApproval ? createMockApprovalModel(child.resource, {
+		approvalId: child.resource.toString(),
+		kind: AgentSessionApprovalKind.Terminal,
+		label: 'npm install --save express@latest',
+		languageId: 'sh',
+		since: new Date(),
+		confirm: () => { },
+	}) : undefined;
+	const sessionRenderer = disposableStore.add(
+		instantiationService.createInstance(AgentSessionRenderer, rendererOptions, approvalModel, observableValue<URI | undefined>('activeSessionResource', undefined))
+	);
+	const chatRenderer = instantiationService.createInstance(AgentSessionChatRenderer, sessionRenderer, () => true);
+	const parent = createMockSession({
+		resource: parentResource,
+		label: 'Hello Chat',
+		status: AgentSessionStatus.Completed,
+		providerType: AgentSessionProviders.Local,
+		children: [child],
+		changes: { files: 1, insertions: 2, deletions: 0 },
+		timing: {
+			created: now - 4 * 24 * 60 * 60 * 1000,
+			lastRequestStarted: now - 4 * 24 * 60 * 60 * 1000,
+			lastRequestEnded: now - 4 * 24 * 60 * 60 * 1000 + 30 * 1000,
+		},
+	});
+	const childHeight = new AgentSessionsListDelegate(approvalModel).getHeight(child);
+
+	container.classList.add('monaco-workbench', 'modern-ui');
+	container.style.width = '350px';
+	container.style.height = `${AgentSessionsListDelegate.COMPACT_ITEM_HEIGHT + childHeight}px`;
+	container.style.backgroundColor = 'var(--vscode-sideBar-background)';
+
+	const viewer = document.createElement('div');
+	viewer.classList.add('agent-sessions-viewer');
+	viewer.style.position = 'relative';
+	viewer.style.height = '100%';
+	container.appendChild(viewer);
+
+	const createRow = (top: number, height: number): { row: HTMLElement; contents: HTMLElement } => {
+		const row = document.createElement('div');
+		row.classList.add('monaco-list-row');
+		row.style.top = `${top}px`;
+		row.style.height = `${height}px`;
+		const treeRow = document.createElement('div');
+		treeRow.classList.add('monaco-tl-row');
+		const contents = document.createElement('div');
+		contents.classList.add('monaco-tl-contents');
+		treeRow.appendChild(contents);
+		row.appendChild(treeRow);
+		viewer.appendChild(row);
+		return { row, contents };
+	};
+
+	const parentNode = wrapAsTreeNode(parent);
+	const parentRow = createRow(0, AgentSessionsListDelegate.COMPACT_ITEM_HEIGHT);
+	parentRow.row.setAttribute('aria-expanded', 'true');
+	const parentTemplate = sessionRenderer.renderTemplate(parentRow.contents);
+	sessionRenderer.renderElement(parentNode, 0, parentTemplate);
+
+	const childNode = wrapAsTreeNode(child);
+	const childRow = createRow(AgentSessionsListDelegate.COMPACT_ITEM_HEIGHT, childHeight);
+	const childTemplate = chatRenderer.renderTemplate(childRow.contents);
+	chatRenderer.renderElement(childNode, 0, childTemplate);
+
+	disposableStore.add(toDisposable(() => {
+		chatRenderer.disposeElement(childNode, 0, childTemplate);
+		chatRenderer.disposeTemplate(childTemplate);
+		sessionRenderer.disposeElement(parentNode, 0, parentTemplate);
+		sessionRenderer.disposeTemplate(parentTemplate);
+	}));
+}
+
+function renderSessionList(ctx: ComponentFixtureContext, sessions: IAgentSession[]): void {
+	const { container, disposableStore } = ctx;
+	const instantiationService = createAgentSessionInstantiationService(ctx);
+
+	const renderer = disposableStore.add(
+		instantiationService.createInstance(AgentSessionRenderer, rendererOptions, undefined, observableValue<URI | undefined>('activeSessionResource', undefined))
+	);
+
+	container.style.width = '350px';
+	container.style.height = 'auto';
+	container.style.backgroundColor = 'var(--vscode-sideBar-background)';
+	container.classList.add('agent-sessions-viewer');
+
+	for (const session of sessions) {
+		const listRow = document.createElement('div');
+		listRow.classList.add('monaco-list-row');
+		listRow.style.position = 'relative';
+		container.appendChild(listRow);
+
+		const template = renderer.renderTemplate(listRow);
+		const treeNode = wrapAsTreeNode(session);
+		renderer.renderElement(treeNode, 0, template);
+		disposableStore.add(toDisposable(() => {
+			renderer.disposeElement(treeNode, 0, template);
+			renderer.disposeTemplate(template);
+		}));
+	}
 }
 
 function renderSectionItem(ctx: ComponentFixtureContext, section: IAgentSessionSection): void {
@@ -148,311 +307,480 @@ function renderSectionItem(ctx: ComponentFixtureContext, section: IAgentSessionS
 	container.appendChild(listRow);
 
 	const template = renderer.renderTemplate(listRow);
-	renderer.renderElement(wrapAsTreeNode(section), 0, template);
+	const treeNode = wrapAsTreeNode(section);
+	renderer.renderElement(treeNode, 0, template);
+	disposableStore.add(toDisposable(() => {
+		renderer.disposeElement(treeNode, 0, template);
+		renderer.disposeTemplate(template);
+	}));
 }
 
 // ============================================================================
 // Fixtures
+//
+// Each fixture computes `now` inside its render function so that timestamps
+// anchor to the virtual clock at render time, not module-load time. Without
+// this, real time keeps advancing between module load and render, making
+// relative labels like "30 min ago" / "31 min ago" flake from one run to the
+// next.
 // ============================================================================
 
-const now = Date.now();
-
 export default defineThemedFixtureGroup({
+
+	SessionWithPeerChat: defineComponentFixture({
+		labels: { kind: 'screenshot', blocksCi: true },
+		expectedVisualDescriptions: ['A completed session titled "Hello Chat" has one compact peer chat child. A single uninterrupted vertical guide connects the parent to a rounded elbow ending at the child status dot, with no gap between rows.'],
+		render: renderSessionHierarchy,
+	}),
+
+	SessionWithPeerChatApproval: defineComponentFixture({
+		expectedVisualDescriptions: ['A completed session titled "Hello Chat" has one compact peer chat child with a styled approval row containing a truncated terminal command and an Allow button. The hierarchy guide remains continuous beside the expanded peer row.'],
+		render: ctx => renderSessionHierarchy(ctx, true),
+	}),
 
 	// --- Status variants ---
 
 	CompletedRead: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Refactor auth middleware',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			timing: {
-				created: now - 2 * 60 * 60 * 1000,
-				lastRequestStarted: now - 2 * 60 * 60 * 1000,
-				lastRequestEnded: now - 2 * 60 * 60 * 1000 + 45 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Refactor auth middleware',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				timing: {
+					created: now - 2 * 60 * 60 * 1000,
+					lastRequestStarted: now - 2 * 60 * 60 * 1000,
+					lastRequestEnded: now - 2 * 60 * 60 * 1000 + 45 * 1000,
+				},
+			}));
+		},
 	}),
 
 	CompletedUnread: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Add unit tests for parser',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			isRead: () => false,
-			timing: {
-				created: now - 30 * 60 * 1000,
-				lastRequestStarted: now - 30 * 60 * 1000,
-				lastRequestEnded: now - 25 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Add unit tests for parser',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				isRead: () => false,
+				timing: {
+					created: now - 30 * 60 * 1000,
+					lastRequestStarted: now - 30 * 60 * 1000,
+					lastRequestEnded: now - 25 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	InProgress: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Implement dark mode toggle',
-			status: AgentSessionStatus.InProgress,
-			providerType: AgentSessionProviders.Local,
-			timing: {
-				created: now - 5 * 60 * 1000,
-				lastRequestStarted: now - 2 * 60 * 1000,
-				lastRequestEnded: undefined,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Implement dark mode toggle',
+				status: AgentSessionStatus.InProgress,
+				providerType: AgentSessionProviders.Local,
+				timing: {
+					created: now - 5 * 60 * 1000,
+					lastRequestStarted: now - 2 * 60 * 1000,
+					lastRequestEnded: undefined,
+				},
+			}));
+		},
 	}),
 
 	NeedsInput: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Fix CI pipeline configuration',
-			status: AgentSessionStatus.NeedsInput,
-			providerType: AgentSessionProviders.Local,
-			isRead: () => false,
-			timing: {
-				created: now - 10 * 60 * 1000,
-				lastRequestStarted: now - 8 * 60 * 1000,
-				lastRequestEnded: undefined,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Fix CI pipeline configuration',
+				status: AgentSessionStatus.NeedsInput,
+				providerType: AgentSessionProviders.Local,
+				isRead: () => false,
+				timing: {
+					created: now - 10 * 60 * 1000,
+					lastRequestStarted: now - 8 * 60 * 1000,
+					lastRequestEnded: undefined,
+				},
+			}));
+		},
 	}),
 
 	FailedWithDuration: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Deploy staging environment',
-			status: AgentSessionStatus.Failed,
-			providerType: AgentSessionProviders.Local,
-			timing: {
-				created: now - 60 * 60 * 1000,
-				lastRequestStarted: now - 60 * 60 * 1000,
-				lastRequestEnded: now - 60 * 60 * 1000 + 3 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Deploy staging environment',
+				status: AgentSessionStatus.Failed,
+				providerType: AgentSessionProviders.Local,
+				timing: {
+					created: now - 60 * 60 * 1000,
+					lastRequestStarted: now - 60 * 60 * 1000,
+					lastRequestEnded: now - 60 * 60 * 1000 + 3 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	FailedWithoutDuration: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Migrate database schema',
-			status: AgentSessionStatus.Failed,
-			providerType: AgentSessionProviders.Local,
-			timing: {
-				created: now - 3 * 60 * 60 * 1000,
-				lastRequestStarted: undefined,
-				lastRequestEnded: undefined,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Migrate database schema',
+				status: AgentSessionStatus.Failed,
+				providerType: AgentSessionProviders.Local,
+				timing: {
+					created: now - 3 * 60 * 60 * 1000,
+					lastRequestStarted: undefined,
+					lastRequestEnded: undefined,
+				},
+			}));
+		},
 	}),
 
 	// --- Content variants ---
 
 	WithDiffChanges: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Refactor settings page',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			changes: { files: 5, insertions: 142, deletions: 87 },
-			timing: {
-				created: now - 45 * 60 * 1000,
-				lastRequestStarted: now - 45 * 60 * 1000,
-				lastRequestEnded: now - 40 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Refactor settings page',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				changes: { files: 5, insertions: 142, deletions: 87 },
+				timing: {
+					created: now - 45 * 60 * 1000,
+					lastRequestStarted: now - 45 * 60 * 1000,
+					lastRequestEnded: now - 40 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	WithFileChangesList: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Update API endpoints',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Background,
-			icon: Codicon.worktree,
-			changes: [
-				{ modifiedUri: URI.file('/src/api/routes.ts'), insertions: 25, deletions: 10 },
-				{ modifiedUri: URI.file('/src/api/handlers.ts'), insertions: 50, deletions: 30 },
-				{ modifiedUri: URI.file('/tests/api.test.ts'), insertions: 40, deletions: 5 },
-			],
-			timing: {
-				created: now - 2 * 60 * 60 * 1000,
-				lastRequestStarted: now - 2 * 60 * 60 * 1000,
-				lastRequestEnded: now - 90 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Update API endpoints',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Background,
+				icon: Codicon.worktree,
+				changes: [
+					{ modifiedUri: URI.file('/src/api/routes.ts'), insertions: 25, deletions: 10 },
+					{ modifiedUri: URI.file('/src/api/handlers.ts'), insertions: 50, deletions: 30 },
+					{ modifiedUri: URI.file('/tests/api.test.ts'), insertions: 40, deletions: 5 },
+				],
+				timing: {
+					created: now - 2 * 60 * 60 * 1000,
+					lastRequestStarted: now - 2 * 60 * 60 * 1000,
+					lastRequestEnded: now - 90 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	WithBadge: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Optimize build pipeline',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			badge: 'PR #1234',
-			timing: {
-				created: now - 4 * 60 * 60 * 1000,
-				lastRequestStarted: now - 4 * 60 * 60 * 1000,
-				lastRequestEnded: now - 3.5 * 60 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Optimize build pipeline',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				badge: 'PR #1234',
+				timing: {
+					created: now - 4 * 60 * 60 * 1000,
+					lastRequestStarted: now - 4 * 60 * 60 * 1000,
+					lastRequestEnded: now - 3.5 * 60 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	WithMarkdownBadge: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Review security patches',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Cloud,
-			icon: Codicon.cloud,
-			badge: new MarkdownString('$(shield) Secure'),
-			timing: {
-				created: now - 6 * 60 * 60 * 1000,
-				lastRequestStarted: now - 6 * 60 * 60 * 1000,
-				lastRequestEnded: now - 5.5 * 60 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Review security patches',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Cloud,
+				icon: Codicon.cloud,
+				badge: new MarkdownString('$(shield) Secure'),
+				timing: {
+					created: now - 6 * 60 * 60 * 1000,
+					lastRequestStarted: now - 6 * 60 * 60 * 1000,
+					lastRequestEnded: now - 5.5 * 60 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	WithDescription: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Upgrade dependencies',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			description: 'Updated 12 packages to latest versions',
-			timing: {
-				created: now - 24 * 60 * 60 * 1000,
-				lastRequestStarted: now - 24 * 60 * 60 * 1000,
-				lastRequestEnded: now - 23.5 * 60 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Upgrade dependencies',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				description: 'Updated 12 packages to latest versions',
+				timing: {
+					created: now - 24 * 60 * 60 * 1000,
+					lastRequestStarted: now - 24 * 60 * 60 * 1000,
+					lastRequestEnded: now - 23.5 * 60 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	WithMarkdownDescription: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Fix accessibility issues',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			description: new MarkdownString('$(check) All WCAG checks passed'),
-			timing: {
-				created: now - 48 * 60 * 60 * 1000,
-				lastRequestStarted: now - 48 * 60 * 60 * 1000,
-				lastRequestEnded: now - 47 * 60 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Fix accessibility issues',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				description: new MarkdownString('$(check) All WCAG checks passed'),
+				timing: {
+					created: now - 48 * 60 * 60 * 1000,
+					lastRequestStarted: now - 48 * 60 * 60 * 1000,
+					lastRequestEnded: now - 47 * 60 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	WithBadgeAndDiff: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Implement search feature',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			badge: 'draft',
-			changes: { files: 8, insertions: 320, deletions: 45 },
-			timing: {
-				created: now - 3 * 60 * 60 * 1000,
-				lastRequestStarted: now - 3 * 60 * 60 * 1000,
-				lastRequestEnded: now - 2.5 * 60 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Implement search feature',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				badge: 'draft',
+				changes: { files: 8, insertions: 320, deletions: 45 },
+				timing: {
+					created: now - 3 * 60 * 60 * 1000,
+					lastRequestStarted: now - 3 * 60 * 60 * 1000,
+					lastRequestEnded: now - 2.5 * 60 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	// --- State variants ---
 
 	Archived: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Old migration script',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			isArchived: () => true,
-			timing: {
-				created: now - 7 * 24 * 60 * 60 * 1000,
-				lastRequestStarted: now - 7 * 24 * 60 * 60 * 1000,
-				lastRequestEnded: now - 7 * 24 * 60 * 60 * 1000 + 10 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Old migration script',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				isArchived: () => true,
+				timing: {
+					created: now - 7 * 24 * 60 * 60 * 1000,
+					lastRequestStarted: now - 7 * 24 * 60 * 60 * 1000,
+					lastRequestEnded: now - 7 * 24 * 60 * 60 * 1000 + 10 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	ArchivedUnread: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Archived unread task',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Local,
-			isArchived: () => true,
-			isRead: () => false,
-			timing: {
-				created: now - 5 * 24 * 60 * 60 * 1000,
-				lastRequestStarted: now - 5 * 24 * 60 * 60 * 1000,
-				lastRequestEnded: now - 5 * 24 * 60 * 60 * 1000 + 5 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Archived unread task',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Local,
+				isArchived: () => true,
+				isRead: () => false,
+				timing: {
+					created: now - 5 * 24 * 60 * 60 * 1000,
+					lastRequestStarted: now - 5 * 24 * 60 * 60 * 1000,
+					lastRequestEnded: now - 5 * 24 * 60 * 60 * 1000 + 5 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	// --- Provider-type variants ---
 
 	CloudProvider: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Generate API documentation',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Cloud,
-			icon: Codicon.cloud,
-			timing: {
-				created: now - 90 * 60 * 1000,
-				lastRequestStarted: now - 90 * 60 * 1000,
-				lastRequestEnded: now - 80 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Generate API documentation',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Cloud,
+				icon: Codicon.cloud,
+				timing: {
+					created: now - 90 * 60 * 1000,
+					lastRequestStarted: now - 90 * 60 * 1000,
+					lastRequestEnded: now - 80 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	BackgroundProvider: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Run linter across codebase',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Background,
-			icon: Codicon.worktree,
-			timing: {
-				created: now - 120 * 60 * 1000,
-				lastRequestStarted: now - 120 * 60 * 1000,
-				lastRequestEnded: now - 110 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Run linter across codebase',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.Background,
+				icon: Codicon.worktree,
+				timing: {
+					created: now - 120 * 60 * 1000,
+					lastRequestStarted: now - 120 * 60 * 1000,
+					lastRequestEnded: now - 110 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	ClaudeProvider: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Analyze code complexity',
-			status: AgentSessionStatus.Completed,
-			providerType: AgentSessionProviders.Claude,
-			icon: Codicon.claude,
-			timing: {
-				created: now - 150 * 60 * 1000,
-				lastRequestStarted: now - 150 * 60 * 1000,
-				lastRequestEnded: now - 140 * 60 * 1000,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Analyze code complexity',
+				status: AgentSessionStatus.Completed,
+				providerType: AgentSessionProviders.AgentHostClaude,
+				icon: Codicon.claude,
+				timing: {
+					created: now - 150 * 60 * 1000,
+					lastRequestStarted: now - 150 * 60 * 1000,
+					lastRequestEnded: now - 140 * 60 * 1000,
+				},
+			}));
+		},
 	}),
 
 	CloudProviderInProgress: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Build integration tests',
-			status: AgentSessionStatus.InProgress,
-			providerType: AgentSessionProviders.Cloud,
-			icon: Codicon.cloud,
-			isRead: () => false,
-			timing: {
-				created: now - 10 * 60 * 1000,
-				lastRequestStarted: now - 3 * 60 * 1000,
-				lastRequestEnded: undefined,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Build integration tests',
+				status: AgentSessionStatus.InProgress,
+				providerType: AgentSessionProviders.Cloud,
+				icon: Codicon.cloud,
+				isRead: () => false,
+				timing: {
+					created: now - 10 * 60 * 1000,
+					lastRequestStarted: now - 3 * 60 * 1000,
+					lastRequestEnded: undefined,
+				},
+			}));
+		},
+	}),
+
+	MixedHarnesses: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: (ctx) => {
+			const now = Date.now();
+			const minutes = (n: number) => n * 60 * 1000;
+			renderSessionList(ctx, [
+				createMockSession({
+					label: 'Refactor settings editor',
+					status: AgentSessionStatus.Completed,
+					providerType: AgentSessionProviders.Local,
+					icon: Codicon.vm,
+					changes: { files: 3, insertions: 42, deletions: 7 },
+					timing: { created: now - minutes(20), lastRequestStarted: now - minutes(20), lastRequestEnded: now - minutes(15) },
+				}),
+				createMockSession({
+					label: 'Fix flaky terminal tests',
+					status: AgentSessionStatus.InProgress,
+					providerType: AgentSessionProviders.Background,
+					icon: Codicon.worktree,
+					badge: '$(worktree) fix-flaky-tests',
+					timing: { created: now - minutes(10), lastRequestStarted: now - minutes(2), lastRequestEnded: undefined },
+				}),
+				createMockSession({
+					label: 'Analyze code complexity',
+					status: AgentSessionStatus.NeedsInput,
+					providerType: AgentSessionProviders.AgentHostClaude,
+					icon: Codicon.claude,
+					timing: { created: now - minutes(40), lastRequestStarted: now - minutes(35), lastRequestEnded: undefined },
+				}),
+				createMockSession({
+					label: 'Migrate build scripts to ESM',
+					status: AgentSessionStatus.Completed,
+					providerType: AgentSessionProviders.AgentHostCodex,
+					icon: Codicon.openai,
+					isRead: () => false,
+					changes: { files: 5, insertions: 120, deletions: 64 },
+					timing: { created: now - minutes(90), lastRequestStarted: now - minutes(90), lastRequestEnded: now - minutes(80) },
+				}),
+				createMockSession({
+					label: 'Generate API documentation',
+					status: AgentSessionStatus.Failed,
+					providerType: AgentSessionProviders.Cloud,
+					icon: Codicon.cloud,
+					badge: '$(repo) microsoft/vscode',
+					timing: { created: now - minutes(150), lastRequestStarted: now - minutes(150), lastRequestEnded: now - minutes(140) },
+				}),
+			]);
+		},
+	}),
+
+	DescriptionRows: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: (ctx) => {
+			const now = Date.now();
+			const hours = (n: number) => n * 60 * 60 * 1000;
+			renderSessionList(ctx, [
+				createMockSession({
+					label: 'Deploy staging environment',
+					status: AgentSessionStatus.Failed,
+					providerType: AgentSessionProviders.Local,
+					timing: { created: now - hours(1), lastRequestStarted: now - hours(1), lastRequestEnded: now - hours(1) + 3 * 60 * 1000 },
+				}),
+				createMockSession({
+					label: 'Upgrade dependencies',
+					status: AgentSessionStatus.Completed,
+					providerType: AgentSessionProviders.Local,
+					description: 'Updated 12 packages to latest versions',
+					timing: { created: now - hours(24), lastRequestStarted: now - hours(24), lastRequestEnded: now - hours(23.5) },
+				}),
+				createMockSession({
+					label: 'Audit telemetry events',
+					status: AgentSessionStatus.Completed,
+					providerType: AgentSessionProviders.AgentHostClaude,
+					icon: Codicon.claude,
+					description: 'Reviewed every event classification and flagged the ones missing owners',
+					timing: { created: now - hours(48), lastRequestStarted: now - hours(48), lastRequestEnded: now - hours(47) },
+				}),
+				createMockSession({
+					label: 'Scaffold new microservice',
+					status: AgentSessionStatus.InProgress,
+					providerType: AgentSessionProviders.Background,
+					icon: Codicon.worktree,
+					description: 'Installing dependencies...',
+					timing: { created: now - 5 * 60 * 1000, lastRequestStarted: now - 60 * 1000, lastRequestEnded: undefined },
+				}),
+			]);
+		},
 	}),
 
 	// --- In-progress with description override ---
 
 	InProgressWithDescription: defineComponentFixture({
-		render: (ctx) => renderSessionItem(ctx, createMockSession({
-			label: 'Scaffold new microservice',
-			status: AgentSessionStatus.InProgress,
-			providerType: AgentSessionProviders.Background,
-			icon: Codicon.worktree,
-			description: 'Installing dependencies...',
-			timing: {
-				created: now - 5 * 60 * 1000,
-				lastRequestStarted: now - 60 * 1000,
-				lastRequestEnded: undefined,
-			},
-		})),
+		render: (ctx) => {
+			const now = Date.now();
+			renderSessionItem(ctx, createMockSession({
+				label: 'Scaffold new microservice',
+				status: AgentSessionStatus.InProgress,
+				providerType: AgentSessionProviders.Background,
+				icon: Codicon.worktree,
+				description: 'Installing dependencies...',
+				timing: {
+					created: now - 5 * 60 * 1000,
+					lastRequestStarted: now - 60 * 1000,
+					lastRequestEnded: undefined,
+				},
+			}));
+		},
 	}),
 
 	// --- Section headers ---
@@ -509,8 +837,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRowJson: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-json');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Other,
 				label: '{ "action": "deleteFile", "path": "/src/old-module.ts" }',
 				languageId: 'json',
 				since: new Date(),
@@ -532,8 +863,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRowBash: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-bash');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'npm install --save express@latest',
 				languageId: 'sh',
 				since: new Date(),
@@ -555,8 +889,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRowPowerShell: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-powershell');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'Start-Job -ScriptBlock { Set-Location \'c:\\some\\path\'; npm install } | Out-Null',
 				languageId: 'pwsh',
 				since: new Date(),
@@ -578,8 +915,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRowLongLabel: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-long');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'rm -rf node_modules && npm cache clean --force && npm install --legacy-peer-deps --ignore-scripts',
 				languageId: 'sh',
 				since: new Date(),
@@ -603,8 +943,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRow1Line: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-1line');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'npm install --save express@latest',
 				languageId: 'sh',
 				since: new Date(),
@@ -626,8 +969,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRow2Lines: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-2lines');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'cd /workspace/project\nnpm install',
 				languageId: 'sh',
 				since: new Date(),
@@ -649,8 +995,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRow3Lines: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-3lines');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'cd /workspace/project\nnpm install\nnpm run build',
 				languageId: 'sh',
 				since: new Date(),
@@ -672,8 +1021,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRow4Lines: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-4lines');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'cd /workspace/project\nnpm install\nnpm run build\nnpm run test -- --coverage',
 				languageId: 'sh',
 				since: new Date(),
@@ -695,8 +1047,11 @@ export default defineThemedFixtureGroup({
 
 	ApprovalRow3LongLines: defineComponentFixture({
 		render: (ctx) => {
+			const now = Date.now();
 			const resource = URI.parse('vscode-chat-session://local/approval-3longlines');
 			const approvalModel = createMockApprovalModel(resource, {
+				approvalId: resource.toString(),
+				kind: AgentSessionApprovalKind.Terminal,
 				label: 'RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release --target x86_64-unknown-linux-gnu\nfind ./target/release -name "*.so" -exec strip --strip-unneeded {} \\; && tar czf release-bundle.tar.gz -C target/release .\ncurl -X POST https://deploy.internal.example.com/api/v2/artifacts/upload --header "Authorization: Bearer $DEPLOY_TOKEN" --form "bundle=@release-bundle.tar.gz"',
 				languageId: 'sh',
 				since: new Date(),

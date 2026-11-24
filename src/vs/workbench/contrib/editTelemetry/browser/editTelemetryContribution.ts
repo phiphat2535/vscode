@@ -13,8 +13,7 @@ import { ITelemetryService, TelemetryLevel, telemetryLevelEnabled } from '../../
 import { AnnotatedDocuments } from './helpers/annotatedDocuments.js';
 import { EditTrackingFeature } from './telemetry/editSourceTrackingFeature.js';
 import { VSCodeWorkspace } from './helpers/vscodeObservableWorkspace.js';
-import { AiStatsFeature } from './editStats/aiStatsFeature.js';
-import { AI_STATS_SETTING_ID, EDIT_TELEMETRY_SETTING_ID } from './settingIds.js';
+import { EDIT_TELEMETRY_SETTING_ID } from './settingIds.js';
 import { IChatEntitlementService } from '../../../services/chat/common/chatEntitlementService.js';
 import { AiContributionFeature } from './aiContributionFeature.js';
 
@@ -39,17 +38,6 @@ export class EditTelemetryContribution extends Disposable {
 			r.store.add(instantiationService.createInstance(EditTrackingFeature, workspace.read(r), annotatedDocuments.read(r)));
 		}));
 
-		const aiStatsEnabled = observableConfigValue(AI_STATS_SETTING_ID, true, configurationService);
-		this._register(autorun(r => {
-			const enabled = aiStatsEnabled.read(r);
-			const aiDisabled = chatEntitlementService.sentimentObs.read(r).hidden;
-			if (!enabled || aiDisabled) {
-				return;
-			}
-
-			r.store.add(instantiationService.createInstance(AiStatsFeature, annotatedDocuments.read(r)));
-		}));
-
 		// Register no-op fallbacks so that extensions can always call these
 		// commands even when AiContributionFeature is not active.
 		// AiContributionFeature overrides these with real implementations
@@ -61,6 +49,10 @@ export class EditTelemetryContribution extends Disposable {
 		const addAICoAuthor = observableConfigValue('git.addAICoAuthor', 'off', configurationService);
 		this._register(autorun(r => {
 			if (addAICoAuthor.read(r) === 'off') {
+				return;
+			}
+			const aiDisabled = chatEntitlementService.sentimentObs.read(r).hidden;
+			if (aiDisabled) {
 				return;
 			}
 			r.store.add(instantiationService.createInstance(AiContributionFeature, annotatedDocuments.read(r)));

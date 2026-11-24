@@ -1,0 +1,426 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import assert from 'assert';
+import { decodeHex, encodeHex, VSBuffer } from '../../../base/common/buffer.js';
+import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../base/test/common/utils.js';
+import { upcastPartial } from '../../../base/test/common/mock.js';
+import { IRemoteAgentHostEntry, IRemoteAgentHostService, getEntryAddress, RemoteAgentHostEntryType } from '../../../platform/agentHost/common/remoteAgentHostService.js';
+import { AGENT_HOST_SCHEME, agentHostAuthority, LOCAL_AGENT_HOST_AUTHORITY, toAgentHostUri } from '../../../platform/agentHost/common/agentHostUri.js';
+import { URI } from '../../../base/common/uri.js';
+import { resolveDevContainerSourceWorkspace, resolveRemoteAuthority, resolveRemoteFolderUri, sshAuthorityString } from '../../../workbench/contrib/sessions/browser/openInVSCodeUtils.js';
+import { devContainerSamples, devContainerSampleUri } from '../../../platform/agentHost/common/devContainerSamples.js';
+import { ISessionsProvidersService } from '../../../workbench/contrib/sessions/browser/sessionsProvidersService.js';
+import { IAgentHostSessionsProvider } from '../../../workbench/contrib/sessions/common/agentHostSessionsProvider.js';
+
+suite('resolveRemoteAuthority', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	function makeProvidersService(remoteAddress?: string): ISessionsProvidersService {
+		return {
+			getProvider: (id: string) => remoteAddress ? { id, remoteAddress } : undefined,
+		} as unknown as ISessionsProvidersService; // no-as-any justification: lightweight test mock for a multi-method service interface
+	}
+
+	function makeRemoteAgentHostService(entries: IRemoteAgentHostEntry[] = []): IRemoteAgentHostService {
+		return {
+			getEntryByAddress: (address: string) => entries.find(e => getEntryAddress(e) === address),
+		} as unknown as IRemoteAgentHostService; // no-as-any justification: lightweight test mock for a multi-method service interface
+	}
+
+	test('returns undefined for a local provider', () => {
+		const result = resolveRemoteAuthority(
+			'local-provider',
+			makeProvidersService(undefined) as ISessionsProvidersService,
+			makeRemoteAgentHostService() as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, undefined);
+	});
+
+	test('returns undefined when provider has no remoteAddress', () => {
+		const noRemoteProviders = {
+			getProvider: (id: string) => ({ id /* no remoteAddress */ }),
+		} as unknown as ISessionsProvidersService; // no-as-any justification: lightweight test mock for a multi-method service interface
+		const result = resolveRemoteAuthority(
+			'agenthost-no-address',
+			noRemoteProviders,
+			makeRemoteAgentHostService() as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, undefined);
+	});
+
+	test('returns ssh-remote authority for SSH with sshConfigHost', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-myserver',
+			makeProvidersService('localhost:4321') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'My Server',
+				connection: {
+					type: RemoteAgentHostEntryType.SSH,
+					address: 'localhost:4321',
+					sshConfigHost: 'my-ssh-host',
+					hostName: 'myserver.example.com',
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, 'ssh-remote+my-ssh-host');
+	});
+
+	test('returns ssh-remote with simple hostName for SSH without sshConfigHost', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-myserver',
+			makeProvidersService('localhost:4321') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'My Server',
+				connection: {
+					type: RemoteAgentHostEntryType.SSH,
+					address: 'localhost:4321',
+					hostName: 'myserver',
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, 'ssh-remote+myserver');
+	});
+
+	test('returns ssh-remote with hex-encoded authority for SSH with user and port', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-myserver',
+			makeProvidersService('localhost:4321') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'My Server',
+				connection: {
+					type: RemoteAgentHostEntryType.SSH,
+					address: 'localhost:4321',
+					hostName: 'myserver.example.com',
+					user: 'admin',
+					port: 2222,
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.ok(result?.startsWith('ssh-remote+'));
+		// The authority should be hex-encoded JSON
+		const authority = result!.slice('ssh-remote+'.length);
+		const decoded = decodeHex(authority).toString();
+		assert.deepStrictEqual(JSON.parse(decoded), {
+			hostName: 'myserver.example.com',
+			user: 'admin',
+			port: 2222,
+		});
+	});
+
+	test('returns tunnel authority using label', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-tunnel',
+			makeProvidersService('tunnel:myTunnelId') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'My Tunnel',
+				connection: {
+					type: RemoteAgentHostEntryType.Tunnel,
+					tunnelId: 'myTunnelId',
+					clusterId: 'usw2',
+					label: 'my-machine',
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, 'tunnel+my-machine');
+	});
+
+	test('returns tunnel authority falling back to tunnelId when no label', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-tunnel',
+			makeProvidersService('tunnel:myTunnelId') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'My Tunnel',
+				connection: {
+					type: RemoteAgentHostEntryType.Tunnel,
+					tunnelId: 'myTunnelId',
+					clusterId: 'usw2',
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, 'tunnel+myTunnelId.usw2');
+	});
+
+	test('returns a WSL authority and folder URI using the distribution, not the host label', () => {
+		const providersService = makeProvidersService('wsl:Ubuntu-24.04');
+		const remoteService = makeRemoteAgentHostService([{
+			name: 'My Linux Host',
+			connection: { type: RemoteAgentHostEntryType.WSL, address: 'wsl:Ubuntu-24.04', distro: 'Ubuntu-24.04' },
+		}]);
+		const folderUri = resolveRemoteFolderUri(
+			URI.from({ scheme: AGENT_HOST_SCHEME, authority: 'wsl__Ubuntu-24.04', path: '/home/test/project' }),
+			'agenthost-wsl',
+			providersService,
+			remoteService,
+		);
+		assert.deepStrictEqual({
+			authority: resolveRemoteAuthority('agenthost-wsl', providersService, remoteService),
+			folderUri: folderUri && { scheme: folderUri.scheme, authority: folderUri.authority, path: folderUri.path },
+		}, {
+			authority: 'wsl+Ubuntu-24.04',
+			folderUri: { scheme: 'vscode-remote', authority: 'wsl+Ubuntu-24.04', path: '/home/test/project' },
+		});
+	});
+
+	for (const address of [undefined, 'ssh:server', 'tunnel:server', 'wsl:Ubuntu']) {
+		test(`resolves the source workspace from a disconnected container provider on ${address ?? 'local'}`, () => {
+			const source = address ? toAgentHostUri(URI.file('/home/test/project'), agentHostAuthority(address)) : URI.file('/Users/test/project');
+			const provider = upcastPartial<IAgentHostSessionsProvider>({
+				id: 'agenthost-container',
+				devContainerSourceWorkspace: source,
+			});
+			const target = resolveDevContainerSourceWorkspace(provider);
+			assert.deepStrictEqual({
+				target: target && { folderUri: target.folderUri.toString(), providerId: target.providerId },
+				ordinary: resolveDevContainerSourceWorkspace(upcastPartial<IAgentHostSessionsProvider>({ id: 'agenthost-ordinary' })),
+				missing: resolveDevContainerSourceWorkspace(undefined),
+			}, {
+				target: { folderUri: source.toString(), providerId: address ? `agenthost-${agentHostAuthority(address)}` : 'local-agent-host' },
+				ordinary: undefined,
+				missing: undefined,
+			});
+		});
+	}
+
+	function assertDevContainerAuthority(hostPath: string, hostAuthority?: string, expectedHostPath = hostPath, expectedHostAuthority = hostAuthority): void {
+		const address = 'devcontainer:container-id';
+		const providersService = makeProvidersService(address);
+		const remoteAgentHostService = makeRemoteAgentHostService([{
+			name: 'Project Dev Container',
+			connection: {
+				type: RemoteAgentHostEntryType.DevContainer,
+				address,
+				hostPath,
+				hostAuthority,
+			},
+		}]);
+		const authority = resolveRemoteAuthority('agenthost-devcontainer', providersService, remoteAgentHostService);
+		const folderUri = resolveRemoteFolderUri(
+			URI.from({ scheme: AGENT_HOST_SCHEME, authority: 'devcontainer__container-id', path: '/workspaces/project' }),
+			'agenthost-devcontainer',
+			providersService,
+			remoteAgentHostService,
+		);
+
+		assert.deepStrictEqual({
+			authority,
+			decodedHostPath: authority ? decodeHex(authority.slice('dev-container+'.length).split('@')[0]).toString() : undefined,
+			folderUri: folderUri && {
+				scheme: folderUri.scheme,
+				authority: folderUri.authority,
+				path: folderUri.path,
+			},
+		}, {
+			authority: `dev-container+${encodeHex(VSBuffer.fromString(expectedHostPath))}${expectedHostAuthority ? `@${expectedHostAuthority}` : ''}`,
+			decodedHostPath: expectedHostPath,
+			folderUri: {
+				scheme: 'vscode-remote',
+				authority: `dev-container+${encodeHex(VSBuffer.fromString(expectedHostPath))}${expectedHostAuthority ? `@${expectedHostAuthority}` : ''}`,
+				path: '/workspaces/project',
+			},
+		});
+	}
+
+	test('encodes sample repository volumes using the Dev Containers extension authority', () => {
+		const repository = {
+			repositoryPath: 'https://github.com/Microsoft/vscode-remote-try-node',
+			volumeName: 'sample-volume',
+			folder: 'vscode-remote-try-node',
+		};
+		const authority = resolveRemoteAuthority('agenthost-devcontainer', makeProvidersService('devcontainer:sample'), makeRemoteAgentHostService([{
+			name: 'Node Sample',
+			connection: { type: RemoteAgentHostEntryType.DevContainer, address: 'devcontainer:sample', repository },
+		}]));
+		assert.deepStrictEqual(authority ? JSON.parse(decodeHex(authority.slice('dev-container+'.length)).toString()) : undefined, repository);
+	});
+
+	test('opens an environment by the volume folder of its workspace, with the SSH or Tunnel host that runs it, or on WSL in a shared Docker engine', () => {
+		const address = 'devcontainer:environment';
+		const resolve = (hostAuthority?: string, knownVolume = true, volumeOnLocalDockerEngine = false) => {
+			const providersService = makeProvidersService(address);
+			const remoteAgentHostService = makeRemoteAgentHostService([{
+				name: 'Dev Container',
+				connection: { type: RemoteAgentHostEntryType.DevContainer, address, environmentId: 'environment', ...(knownVolume ? { volume: { volumeName: 'ubuntu-2', folder: 'ubuntu-2' } } : {}), ...(hostAuthority ? { hostAuthority } : {}), ...(volumeOnLocalDockerEngine ? { volumeOnLocalDockerEngine } : {}) },
+			}]);
+			const folderUri = resolveRemoteFolderUri(URI.from({ scheme: AGENT_HOST_SCHEME, authority: agentHostAuthority(address), path: '/workspaces/ubuntu-2' }), 'agenthost-environment', providersService, remoteAgentHostService);
+			if (!folderUri) {
+				return undefined;
+			}
+			const [config, parentAuthority] = folderUri.authority.slice('dev-container+'.length).split('@');
+			// The configuration is compared as a string: Dev Containers identifies windows and recent entries by the authority.
+			return { scheme: folderUri.scheme, config: decodeHex(config).toString(), parentAuthority, path: folderUri.path };
+		};
+		const config = '{"volumeName":"ubuntu-2","folder":"ubuntu-2"}';
+		assert.deepStrictEqual({
+			local: resolve(),
+			ssh: resolve('ssh-remote+build'),
+			tunnel: resolve('tunnel+build'),
+			// Dev Containers uses this computer's Docker engine for a volume, which is the WSL distribution's only if it has the volume.
+			wsl: resolve('wsl+Ubuntu'),
+			wslOnLocalDockerEngine: resolve('wsl+Ubuntu', true, true),
+			unknownVolume: resolve(undefined, false),
+		}, {
+			local: { scheme: 'vscode-remote', config, parentAuthority: undefined, path: '/workspaces/ubuntu-2' },
+			ssh: { scheme: 'vscode-remote', config, parentAuthority: 'ssh-remote+build', path: '/workspaces/ubuntu-2' },
+			tunnel: { scheme: 'vscode-remote', config, parentAuthority: 'tunnel+build', path: '/workspaces/ubuntu-2' },
+			wsl: undefined,
+			wslOnLocalDockerEngine: { scheme: 'vscode-remote', config, parentAuthority: undefined, path: '/workspaces/ubuntu-2' },
+			unknownVolume: undefined,
+		});
+	});
+
+	test('does not open an unprovisioned sample as a host folder', () => {
+		assert.throws(() => resolveRemoteFolderUri(
+			devContainerSampleUri(devContainerSamples[0]),
+			'local-agent-host',
+			makeProvidersService(),
+			makeRemoteAgentHostService([]),
+		), /Send the first prompt/);
+	});
+
+	test('does not transfer a window-local remote filesystem without an Editor resolver', () => {
+		const remoteFolder = toAgentHostUri(URI.file('C:\\Users\\test\\project'), agentHostAuthority('cloudsandbox:environment'));
+		const localFolder = toAgentHostUri(URI.file('/local/project'), LOCAL_AGENT_HOST_AUTHORITY);
+		const providers = makeProvidersService('cloudsandbox:environment');
+		const remoteService = makeRemoteAgentHostService([{
+			name: 'Windows dev box',
+			connection: { type: RemoteAgentHostEntryType.CloudSandbox, address: 'cloudsandbox:environment', environmentId: 'environment' },
+		}]);
+		assert.deepStrictEqual({
+			sandbox: resolveRemoteFolderUri(remoteFolder, 'agenthost-sandbox', providers, remoteService),
+			unknown: resolveRemoteFolderUri(remoteFolder, 'unknown', makeProvidersService(), makeRemoteAgentHostService()),
+			local: resolveRemoteFolderUri(localFolder, 'local', makeProvidersService(), makeRemoteAgentHostService()),
+			file: resolveRemoteFolderUri(URI.file('/local/project'), 'local', makeProvidersService(), makeRemoteAgentHostService()),
+		}, {
+			sandbox: undefined,
+			unknown: undefined,
+			local: localFolder,
+			file: URI.file('/local/project'),
+		});
+	});
+
+	test('returns a Dev Containers authority for a POSIX source folder', () => {
+		assertDevContainerAuthority('/Users/test/project');
+	});
+
+	test('returns a Dev Containers authority for a Windows drive-letter source folder', () => {
+		assertDevContainerAuthority('C:\\Users\\Test User\\project');
+	});
+
+	test('returns a Dev Containers authority for a Windows WSL UNC source folder', () => {
+		assertDevContainerAuthority('\\\\wsl.localhost\\Ubuntu\\home\\test\\project');
+	});
+
+	test('preserves the SSH parent authority when opening a remote Dev Container', () => {
+		assertDevContainerAuthority('/home/test/project', 'ssh-remote+server');
+	});
+
+	test('preserves the Tunnel parent authority when opening a remote Dev Container', () => {
+		assertDevContainerAuthority('/home/test/project', 'tunnel+server.region');
+	});
+
+	test('encodes a WSL source as a UNC path without a parent authority', () => {
+		assertDevContainerAuthority('/home/test/My Project', 'wsl+Ubuntu-24.04', '\\\\wsl.localhost\\Ubuntu-24.04\\home\\test\\My Project', '');
+	});
+
+	test('keeps mounted Windows folders scoped to their WSL distribution', () => {
+		assertDevContainerAuthority('/mnt/c/Users/test/project', 'wsl+Fedora', '\\\\wsl.localhost\\Fedora\\mnt\\c\\Users\\test\\project', '');
+	});
+
+	test('returns undefined for WebSocket connections', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-ws',
+			makeProvidersService('myhost:4321') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'WS Host',
+				connection: {
+					type: RemoteAgentHostEntryType.WebSocket,
+					address: 'myhost:4321',
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, undefined);
+	});
+
+	test('returns undefined when no matching entry found', () => {
+		const result = resolveRemoteAuthority(
+			'agenthost-missing',
+			makeProvidersService('unknown-address:9999') as ISessionsProvidersService,
+			makeRemoteAgentHostService([{
+				name: 'Other',
+				connection: {
+					type: RemoteAgentHostEntryType.WebSocket,
+					address: 'different-address:1234',
+				},
+			}]) as IRemoteAgentHostService,
+		);
+		assert.strictEqual(result, undefined);
+	});
+});
+
+suite('sshAuthorityString', () => {
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('hex-encodes when user is present', () => {
+		const result = sshAuthorityString({
+			hostName: 'myserver',
+			user: 'admin',
+		});
+		const decoded = decodeHex(result).toString();
+		assert.deepStrictEqual(JSON.parse(decoded), { hostName: 'myserver', user: 'admin' });
+	});
+
+	test('hex-encodes when port is present', () => {
+		const result = sshAuthorityString({
+			hostName: 'myserver',
+			port: 2222,
+		});
+		const decoded = decodeHex(result).toString();
+		assert.deepStrictEqual(JSON.parse(decoded), { hostName: 'myserver', port: 2222 });
+	});
+
+	test('hex-encodes when hostName has uppercase letters', () => {
+		const result = sshAuthorityString({
+			hostName: 'MyServer',
+		});
+		const decoded = decodeHex(result).toString();
+		assert.deepStrictEqual(JSON.parse(decoded), { hostName: 'MyServer' });
+	});
+
+	test('hex-encodes with all fields', () => {
+		const result = sshAuthorityString({
+			hostName: 'MyServer.example.com',
+			user: 'root',
+			port: 22,
+		});
+		const decoded = decodeHex(result).toString();
+		assert.deepStrictEqual(JSON.parse(decoded), {
+			hostName: 'MyServer.example.com',
+			user: 'root',
+			port: 22,
+		});
+	});
+
+	test('uses a lowercase host name directly', () => {
+		const result = sshAuthorityString({
+			hostName: 'actualhost',
+		});
+		assert.strictEqual(result, 'actualhost');
+	});
+
+	test('encodes like Remote - SSH, which identifies the remote by this string', () => {
+		assert.deepStrictEqual({
+			underscore: sshAuthorityString({ hostName: 'my_host' }),
+			ipv6: sshAuthorityString({ hostName: 'fe80::1' }),
+			plus: JSON.parse(decodeHex(sshAuthorityString({ hostName: 'a+b' })).toString()),
+		}, {
+			underscore: 'my_host',
+			ipv6: 'fe80::1',
+			plus: { hostName: 'a+b' },
+		});
+	});
+});

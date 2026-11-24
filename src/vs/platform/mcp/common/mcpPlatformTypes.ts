@@ -35,7 +35,7 @@ export interface IMcpServerVariable {
 	readonly description: string;
 	readonly password: boolean;
 	readonly default?: string;
-	readonly options?: readonly string[];
+	readonly options?: readonly (string | { readonly value: string; readonly label?: string })[];
 	readonly serverName?: string;
 }
 
@@ -58,13 +58,21 @@ export interface IMcpStdioServerConfiguration extends ICommonMcpServerConfigurat
 	readonly envFile?: string;
 	readonly cwd?: string;
 	readonly sandboxEnabled?: boolean;
+	/** Server-specific permissions, combined with root-level sandbox deny rules. */
+	readonly sandbox?: IMcpSandboxConfiguration;
 	readonly dev?: IMcpDevModeConfig;
+}
+
+export interface IMcpRemoteServerOAuthConfiguration {
+	readonly clientId?: string;
 }
 
 export interface IMcpRemoteServerConfiguration extends ICommonMcpServerConfiguration {
 	readonly type: McpServerType.REMOTE;
+	readonly transport?: 'http' | 'sse';
 	readonly url: string;
 	readonly headers?: Record<string, string>;
+	readonly oauth?: IMcpRemoteServerOAuthConfiguration;
 	readonly dev?: IMcpDevModeConfig;
 }
 

@@ -214,6 +214,10 @@ class WorkbenchHostService extends Disposable implements IHostService {
 		return this.nativeHostService.closeWindow();
 	}
 
+	shutdown(): Promise<void> {
+		return this.nativeHostService.quit();
+	}
+
 	async withExpectedShutdown<T>(expectedShutdownTask: () => Promise<T>): Promise<T> {
 		return await expectedShutdownTask();
 	}
@@ -222,8 +226,8 @@ class WorkbenchHostService extends Disposable implements IHostService {
 
 	//#region Screenshots
 
-	getScreenshot(rect?: IRectangle): Promise<VSBuffer | undefined> {
-		return this.nativeHostService.getScreenshot(rect);
+	getScreenshot(rect?: IRectangle, targetWindow?: Window): Promise<VSBuffer | undefined> {
+		return this.nativeHostService.getScreenshot(rect, targetWindow ? { targetWindowId: getWindowId(targetWindow) } : undefined);
 	}
 
 	//#endregion

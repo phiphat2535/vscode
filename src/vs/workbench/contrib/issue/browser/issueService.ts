@@ -9,6 +9,7 @@ import { userAgent } from '../../../../base/common/platform.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IExtensionManagementService } from '../../../../platform/extensionManagement/common/extensionManagement.js';
 import { ExtensionType, IExtensionDescription } from '../../../../platform/extensions/common/extensions.js';
+import { GitHubAuthorizationContext } from '../../../../platform/github/common/githubTypes.js';
 import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
 import { normalizeGitHubUrl } from '../common/issueReporterUtil.js';
 import { IOpenerService } from '../../../../platform/opener/common/opener.js';
@@ -21,7 +22,9 @@ import { IIssueFormService, IssueReporterData, IssueReporterExtensionData, Issue
 import { IWorkbenchAssignmentService } from '../../../services/assignment/common/assignmentService.js';
 import { IAuthenticationService } from '../../../services/authentication/common/authentication.js';
 import { IWorkbenchExtensionEnablementService } from '../../../services/extensionManagement/common/extensionManagement.js';
+import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
 import { IExtensionService } from '../../../services/extensions/common/extensions.js';
+import { toGitHubAuthorizationContext } from '../../../services/github/common/githubService.js';
 import { IIntegrityService } from '../../../services/integrity/common/integrity.js';
 
 
@@ -40,7 +43,8 @@ export class BrowserIssueService implements IWorkbenchIssueService {
 		@IWorkbenchExtensionEnablementService private readonly extensionEnablementService: IWorkbenchExtensionEnablementService,
 		@IAuthenticationService private readonly authenticationService: IAuthenticationService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
-		@IOpenerService private readonly openerService: IOpenerService
+		@IOpenerService private readonly openerService: IOpenerService,
+		@IWorkbenchEnvironmentService private readonly environmentService: IWorkbenchEnvironmentService
 	) { }
 
 	async openReporter(options: Partial<IssueReporterData>): Promise<void> {
@@ -71,18 +75,23 @@ export class BrowserIssueService implements IWorkbenchIssueService {
 			const experiments = await this.experimentService.getCurrentExperiments();
 
 			let githubAccessToken = '';
+			let githubAuthorization: GitHubAuthorizationContext | undefined;
 			try {
 				const githubSessions = await this.authenticationService.getSessions('github');
-				const potentialSessions = githubSessions.filter(session => session.scopes.includes('repo'));
-				githubAccessToken = potentialSessions[0]?.accessToken;
+				const session = githubSessions.find(session => options.githubAccessToken === undefined
+					? session.scopes.includes('repo')
+					: session.accessToken === options.githubAccessToken);
+				githubAccessToken = session?.accessToken ?? '';
+				githubAuthorization = session && toGitHubAuthorizationContext('github', session);
 			} catch (e) {
 				// Ignore
 			}
 
-			// air on the side of caution and have false be the default
-			let isUnsupported = false;
+			// Default to true (pure) so an integrity-check failure doesn't push an
+			// inaccurate `Modes: ..., Unsupported` line into the issue body.
+			let isInstallationPure = true;
 			try {
-				isUnsupported = !(await this.integrityService.isPure()).isPure;
+				isInstallationPure = (await this.integrityService.isPure()).isPure;
 			} catch (e) {
 				// Ignore
 			}
@@ -132,8 +141,10 @@ export class BrowserIssueService implements IWorkbenchIssueService {
 				enabledExtensions: extensionData,
 				experiments: experiments?.join('\n'),
 				restrictedMode: !this.workspaceTrustManagementService.isWorkspaceTrusted(),
-				isUnsupported,
-				githubAccessToken
+				isInstallationPure,
+				isSessionsWindow: this.environmentService.isSessionsWindow,
+				githubAccessToken,
+				githubAuthorization,
 			}, options);
 
 			return this.issueFormService.openReporter(issueReporterData);

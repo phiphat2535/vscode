@@ -3,7 +3,6 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-use async_trait::async_trait;
 use base64::{engine::general_purpose as b64, Engine as _};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
@@ -31,7 +30,8 @@ use crate::{
 	async_pipe::{get_socket_name, listen_socket_rw_stream, AsyncRWAccepter},
 	auth::Auth,
 	constants::{
-		APPLICATION_NAME, CONTROL_PORT, IS_A_TTY, TUNNEL_CLI_LOCK_NAME, TUNNEL_SERVICE_LOCK_NAME,
+		AGENT_HOST_PORT, APPLICATION_NAME, CONTROL_PORT, IS_A_TTY, TUNNEL_CLI_LOCK_NAME,
+		TUNNEL_SERVICE_LOCK_NAME,
 	},
 	log,
 	state::LauncherPaths,
@@ -39,7 +39,7 @@ use crate::{
 		code_server::CodeServerArgs,
 		create_service_manager,
 		dev_tunnels::{self, DevTunnels},
-		legal, local_forwarding,
+		legal, local_forwarding, machine_status,
 		paths::get_all_servers,
 		protocol, serve_stream,
 		shutdown_signal::ShutdownRequest,
@@ -117,7 +117,6 @@ impl TunnelServiceContainer {
 	}
 }
 
-#[async_trait]
 impl ServiceContainer for TunnelServiceContainer {
 	async fn run_service(
 		&mut self,
@@ -148,6 +147,10 @@ pub async fn command_shell(ctx: CommandContext, args: CommandShellArgs) -> Resul
 		shutdown_reqs.push(ShutdownRequest::ParentProcessKilled(p));
 	}
 
+	// No agent host supervisor here: the spawned VS Code server is the client's
+	// own commit, so it uses a live shared agent host from the endpoint registry
+	// or starts and publishes its own, and stays alive while that agent host
+	// has sessions or clients.
 	let mut params = ServeStreamParams {
 		log: ctx.log,
 		launcher_paths: ctx.paths,
@@ -158,6 +161,7 @@ pub async fn command_shell(ctx: CommandContext, args: CommandShellArgs) -> Resul
 			.unwrap_or(AuthRequired::VSDA),
 		exit_barrier: ShutdownRequest::create_rx(shutdown_reqs),
 		code_server_args: (&ctx.args).into(),
+		active_agent_host: None,
 	};
 
 	args.server_args.apply_to(&mut params.code_server_args);
@@ -330,7 +334,8 @@ pub async fn user(ctx: CommandContext, user_args: TunnelUserSubCommands) -> Resu
 		}
 		TunnelUserSubCommands::Show => {
 			if let Ok(Some(sc)) = auth.get_current_credential() {
-				ctx.log.result(format!("logged in with provider {}", sc.provider));
+				ctx.log
+					.result(format!("logged in with provider {}", sc.provider));
 			} else {
 				ctx.log.result("not logged in");
 				return Ok(1);
@@ -348,7 +353,7 @@ pub async fn rename(ctx: CommandContext, rename_args: TunnelRenameArgs) -> Resul
 	dt.rename_tunnel(&rename_args.name).await?;
 	ctx.log.result(format!(
 		"Successfully renamed this tunnel to {}",
-		&rename_args.name
+		rename_args.name
 	));
 
 	Ok(0)
@@ -569,6 +574,8 @@ async fn serve_with_csa(
 	mut csa: CodeServerArgs,
 	app_mutex_name: Option<&'static str>,
 ) -> Result<i32, AnyError> {
+	machine_status::set_stdout_enabled(gateway_args.machine_status);
+
 	let log_broadcast = BroadcastLogSink::new();
 	log = log.tee(log_broadcast.clone());
 	log::install_global_logger(log.clone()); // re-install so that library logs are captured
@@ -619,6 +626,7 @@ async fn serve_with_csa(
 					log: log.clone(),
 					shutdown: shutdown.clone(),
 					stream,
+					machine_status_enabled: gateway_args.machine_status,
 				})
 				.await;
 				if should_exit {
@@ -637,7 +645,7 @@ async fn serve_with_csa(
 
 	let mut server =
 		make_singleton_server(log_broadcast.clone(), log.clone(), server, shutdown.clone());
-	let platform = spanf!(log, log.span("prereq"), PreReqChecker::new().verify())?;
+	let platform = PreReqChecker::new().verify().await?;
 	let _lock = app_mutex_name.map(AppMutex::new);
 
 	let auth = Auth::new(&paths, log.clone());
@@ -649,7 +657,7 @@ async fn serve_with_csa(
 			dt.start_existing_tunnel(t).await
 		} else {
 			tokio::select! {
-				t = dt.start_new_launcher_tunnel(gateway_args.name.as_deref(), gateway_args.random_name, &[CONTROL_PORT]) => t,
+				t = dt.start_new_launcher_tunnel(gateway_args.name.as_deref(), gateway_args.random_name, &[CONTROL_PORT, AGENT_HOST_PORT]) => t,
 				_ = shutdown.wait() => return Ok(1),
 			}
 		}?;
@@ -662,6 +670,8 @@ async fn serve_with_csa(
 			paths: &paths,
 			code_server_args: &csa,
 			platform,
+			user_data_dir: gateway_args.user_data_dir.clone(),
+			delegate_to_editor: gateway_args.delegate_to_editor,
 			log_broadcast: &log_broadcast,
 			shutdown: shutdown.clone(),
 			server: &mut server,

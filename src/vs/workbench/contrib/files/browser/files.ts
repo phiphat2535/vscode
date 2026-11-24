@@ -18,6 +18,7 @@ import { createDecorator, ServicesAccessor } from '../../../../platform/instanti
 import { ResourceFileEdit } from '../../../../editor/browser/services/bulkEditService.js';
 import { ProgressLocation } from '../../../../platform/progress/common/progress.js';
 import { isActiveElement } from '../../../../base/browser/dom.js';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
 
 export interface IExplorerService {
 	readonly _serviceBrand: undefined;
@@ -36,7 +37,13 @@ export interface IExplorerService {
 	refresh(): Promise<void>;
 	setToCopy(stats: ExplorerItem[], cut: boolean): Promise<void>;
 	isCut(stat: ExplorerItem): boolean;
-	applyBulkEdit(edit: ResourceFileEdit[], options: { undoLabel: string; progressLabel: string; confirmBeforeUndo?: boolean; progressLocation?: ProgressLocation.Explorer | ProgressLocation.Window }): Promise<void>;
+
+	/**
+	 * Applies the file edits with progress. When a `token` is provided, the caller owns
+	 * cancellation and should show its own cancellable progress notification, passing
+	 * `ProgressLocation.Explorer` so that no second, non-cancellable notification is shown.
+	 */
+	applyBulkEdit(edit: ResourceFileEdit[], options: { undoLabel: string; progressLabel: string; confirmBeforeUndo?: boolean; progressLocation?: ProgressLocation.Explorer | ProgressLocation.Window; token?: CancellationToken }): Promise<void>;
 
 	/**
 	 * Selects and reveal the file element provided by the given resource if its found in the explorer.
@@ -45,11 +52,15 @@ export interface IExplorerService {
 	select(resource: URI, reveal?: boolean | string): Promise<void>;
 
 	registerView(contextAndRefreshProvider: IExplorerView): void;
+
+	/** The explorer view id for this application, available before the view is instantiated. */
+	getViewId(): string;
 }
 
 export const IExplorerService = createDecorator<IExplorerService>('explorerService');
 
 export interface IExplorerView {
+	readonly id: string;
 	autoReveal: boolean | 'force' | 'focusNoScroll';
 	getContext(respectMultiSelection: boolean): ExplorerItem[];
 	refresh(recursive: boolean, item?: ExplorerItem, cancelEditing?: boolean): Promise<void>;

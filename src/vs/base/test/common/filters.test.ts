@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 import assert from 'assert';
-import { anyScore, createMatches, fuzzyScore, fuzzyScoreGraceful, fuzzyScoreGracefulAggressive, FuzzyScorer, IFilter, IMatch, matchesBaseContiguousSubString, matchesCamelCase, matchesContiguousSubString, matchesPrefix, matchesStrictPrefix, matchesSubString, matchesWords, or } from '../../common/filters.js';
+import { anyScore, createMatches, emptyMatches, fuzzyScore, fuzzyScoreGraceful, fuzzyScoreGracefulAggressive, FuzzyScorer, IFilter, IMatch, matchesBaseContiguousSubString, matchesCamelCase, matchesContiguousSubString, matchesFuzzy, matchesPrefix, matchesStrictPrefix, matchesSubString, matchesWords, or } from '../../common/filters.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from './utils.js';
 
 function filterOk(filter: IFilter, word: string, wordToMatchAgainst: string, highlights?: { start: number; end: number }[]) {
@@ -20,6 +20,19 @@ function filterNotOk(filter: IFilter, word: string, wordToMatchAgainst: string) 
 
 suite('Filters', () => {
 	ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('empty queries share immutable matches', () => {
+		for (const filter of [matchesFuzzy, matchesContiguousSubString, matchesBaseContiguousSubString]) {
+			const first = filter('', 'first')!;
+			const second = filter('', '')!;
+			assert.strictEqual(first, emptyMatches);
+			assert.strictEqual(second, emptyMatches);
+			assert.throws(() => { first[0].start = 1; }, TypeError);
+			assert.throws(() => { first[0] = { start: 1, end: 2 }; }, TypeError);
+			assert.throws(() => { first.push({ start: 1, end: 2 }); }, TypeError);
+			assert.deepStrictEqual(second, [{ start: 0, end: 0 }]);
+		}
+	});
 
 	test('or', () => {
 		let filter: IFilter;
@@ -252,6 +265,25 @@ suite('Filters', () => {
 		filterOk(matchesWords, 'foo bar', '123 foo-bar 456');
 		filterOk(matchesWords, 'foo-bar', 'foo bar');
 		filterOk(matchesWords, 'foo:bar', 'foo:bar');
+	});
+
+	test('matchesWords performance (#309582)', function () {
+		// Searching for a term containing a word separator (e.g. `.`) against
+		// command-id-like targets used to cause catastrophic backtracking and
+		// freeze the Keyboard Shortcuts editor. Without the fix this loop
+		// exceeds Mocha's default test timeout.
+		const targets = [
+			'workbench.action.terminal.focusNextLine',
+			'editor.action.clipboardCopyAction',
+			'workbench.action.editor.changeLanguageMode',
+			'editor.action.smartSelect.expand',
+			'workbench.action.files.saveAll',
+		];
+		for (let i = 0; i < 1000; i++) {
+			for (const t of targets) {
+				matchesWords('editor.action', t);
+			}
+		}
 	});
 
 	function assertMatches(pattern: string, word: string, decoratedWord: string | undefined, filter: FuzzyScorer, opts: { patternPos?: number; wordPos?: number; firstMatchCanBeWeak?: boolean } = {}) {

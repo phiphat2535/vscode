@@ -28,21 +28,26 @@ import { renderAsPlaintext } from '../../../../../../base/browser/markdownRender
 import { IInstantiationService } from '../../../../../../platform/instantiation/common/instantiation.js';
 import { IMenuService, MenuId, MenuItemAction, SubmenuItemAction } from '../../../../../../platform/actions/common/actions.js';
 import { IContextKeyService } from '../../../../../../platform/contextkey/common/contextkey.js';
+import { InEditorZenModeContext } from '../../../../../common/contextkeys.js';
 import { HiddenItemStrategy, WorkbenchToolBar } from '../../../../../../platform/actions/browser/toolbar.js';
 import { DropdownWithPrimaryActionViewItem } from '../../../../../../platform/actions/browser/dropdownWithPrimaryActionViewItem.js';
 import { createActionViewItem } from '../../../../../../platform/actions/browser/menuEntryActionViewItem.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../../platform/storage/common/storage.js';
 import { FocusAgentSessionsAction } from '../agentSessionsActions.js';
 import { IWorkbenchContribution } from '../../../../../common/contributions.js';
+import { WORKBENCH_MENU_MOTION_CLASS, workbenchMenuCloseAnimation } from '../../../../../browser/actions/menuMotion.js';
 import { IActionViewItemService } from '../../../../../../platform/actions/browser/actionViewItemService.js';
 import { IConfigurationService } from '../../../../../../platform/configuration/common/configuration.js';
 import { mainWindow } from '../../../../../../base/browser/window.js';
 import { LayoutSettings } from '../../../../../services/layout/browser/layoutService.js';
 import { WindowTitle } from '../../../../../browser/parts/titlebar/windowTitle.js';
-import { ChatConfiguration } from '../../../common/constants.js';
-import { ChatEntitlement, IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
+import { IFolderLocation } from '../../../../../../platform/workspace/common/folderLocations.js';
+import { CommandCenterLabel } from '../../../../../browser/parts/titlebar/commandCenterLabel.js';
+import { ChatAIDisabledSettingId, ChatConfiguration } from '../../../common/constants.js';
+import { IChatEntitlementService } from '../../../../../services/chat/common/chatEntitlementService.js';
 import { IChatWidgetService } from '../../chat.js';
 import { ITelemetryService } from '../../../../../../platform/telemetry/common/telemetry.js';
+import { ITitleService } from '../../../../../services/title/browser/titleService.js';
 
 // Telemetry types
 type AgentStatusClickAction =
@@ -51,7 +56,6 @@ type AgentStatusClickAction =
 	| 'focusSessionsView'
 	| 'toggleChat'
 	| 'setupChat'
-	| 'openQuotaExceededDialog'
 	| 'applyFilter'
 	| 'clearFilter'
 	| 'enterProjection'
@@ -71,8 +75,6 @@ type AgentStatusClickClassification = {
 
 // Action IDs
 const TOGGLE_CHAT_ACTION_ID = 'workbench.action.chat.toggle';
-const CHAT_SETUP_ACTION_ID = 'workbench.action.chat.triggerSetup';
-const OPEN_CHAT_QUOTA_EXCEEDED_DIALOG = 'workbench.action.chat.openQuotaExceededDialog';
 const QUICK_OPEN_ACTION_ID = 'workbench.action.quickOpenWithModes';
 
 // Storage key for filter state
@@ -82,17 +84,30 @@ const PREVIOUS_FILTER_STORAGE_KEY = 'agentSessions.filterExcludes.previousUserFi
 
 type AgentStatusSettingMode = 'hidden' | 'badge' | 'compact';
 
-function shouldForceHiddenAgentStatus(configurationService: IConfigurationService): boolean {
-	const aiFeaturesDisabled = configurationService.getValue<boolean>(ChatConfiguration.AIDisabled) === true;
+interface IStoredAgentSessionsFilter {
+	providers: string[];
+	states: AgentSessionStatus[];
+	archived: boolean;
+	read: boolean;
+	automation: boolean;
+	repositoryGroupCapped: boolean;
+}
+
+function shouldForceHiddenAgentStatus(configurationService: IConfigurationService, contextKeyService: IContextKeyService): boolean {
+	// Hide all agent distractions while in Zen mode
+	if (contextKeyService.getContextKeyValue<boolean>(InEditorZenModeContext.key) === true) {
+		return true;
+	}
+
+	const aiFeaturesDisabled = configurationService.getValue<boolean>(ChatAIDisabledSettingId) === true;
 	const aiCustomizationsDisabled = configurationService.getValue<boolean>('disableAICustomizations') === true
-		|| configurationService.getValue<boolean>('workbench.disableAICustomizations') === true
-		|| configurationService.getValue<boolean>(ChatConfiguration.ChatCustomizationMenuEnabled) === false;
+		|| configurationService.getValue<boolean>('workbench.disableAICustomizations') === true;
 
 	return aiFeaturesDisabled && aiCustomizationsDisabled;
 }
 
-function getAgentStatusSettingMode(configurationService: IConfigurationService): AgentStatusSettingMode {
-	if (shouldForceHiddenAgentStatus(configurationService)) {
+function getAgentStatusSettingMode(configurationService: IConfigurationService, contextKeyService: IContextKeyService): AgentStatusSettingMode {
+	if (shouldForceHiddenAgentStatus(configurationService, contextKeyService)) {
 		return 'hidden';
 	}
 
@@ -150,11 +165,9 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 	/** Menu for ChatTitleBarMenu items (same as chat controls dropdown) */
 	private readonly _chatTitleBarMenu;
 
-	/** WindowTitle instance for honoring the user's window.title setting */
-	private readonly _windowTitle: WindowTitle;
-
 	constructor(
 		action: IAction,
+		private readonly _windowTitle: WindowTitle,
 		options: IBaseActionViewItemOptions | undefined,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IAgentTitleBarStatusService private readonly agentTitleBarStatusService: IAgentTitleBarStatusService,
@@ -180,9 +193,6 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 
 		// Create menu for ChatTitleBarMenu to show in sparkle section dropdown
 		this._chatTitleBarMenu = this._register(this.menuService.createMenu(MenuId.ChatTitleBarMenu, this.contextKeyService));
-
-		// Create WindowTitle to honor the user's window.title setting
-		this._windowTitle = this._register(this.instantiationService.createInstance(WindowTitle, mainWindow));
 
 		// Re-render when control mode or session info changes
 		this._register(this.agentTitleBarStatusService.onDidChangeMode(() => {
@@ -226,15 +236,21 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 			this._render();
 		}));
 
+		// Re-render when Zen mode toggles, to hide all agent distractions
+		this._register(this.contextKeyService.onDidChangeContext(e => {
+			if (e.affectsSome(new Set([InEditorZenModeContext.key]))) {
+				this._lastRenderState = undefined; // Force re-render
+				this._render();
+			}
+		}));
+
 		// Re-render when settings change
 		this._register(this.configurationService.onDidChangeConfiguration(e => {
 			if (
 				e.affectsConfiguration(ChatConfiguration.AgentStatusEnabled)
 				|| e.affectsConfiguration(ChatConfiguration.UnifiedAgentsBar)
 				|| e.affectsConfiguration(ChatConfiguration.ChatViewSessionsEnabled)
-				|| e.affectsConfiguration(ChatConfiguration.AIDisabled)
-				|| e.affectsConfiguration(ChatConfiguration.ChatCustomizationMenuEnabled)
-				|| e.affectsConfiguration(ChatConfiguration.SignInTitleBarEnabled)
+				|| e.affectsConfiguration(ChatAIDisabledSettingId)
 				|| e.affectsConfiguration('disableAICustomizations')
 				|| e.affectsConfiguration('workbench.disableAICustomizations')
 			) {
@@ -333,7 +349,7 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 			// Get current filter state for state key
 			const { isFilteredToUnread, isFilteredToInProgress, isFilteredToNeedsInput } = this._getCurrentFilterState();
 
-			const statusMode = getAgentStatusSettingMode(this.configurationService);
+			const statusMode = getAgentStatusSettingMode(this.configurationService, this.contextKeyService);
 			const unifiedAgentsBarEnabled = this.configurationService.getValue<boolean>(ChatConfiguration.UnifiedAgentsBar) === true;
 			const viewSessionsEnabled = this.configurationService.getValue<boolean>(ChatConfiguration.ChatViewSessionsEnabled) !== false;
 
@@ -346,6 +362,7 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 				attentionCount: attentionNeededSessions.length,
 				attentionText,
 				label,
+				folderLocation: this._windowTitle.folderLocationInfo ? { description: this._windowTitle.folderLocationInfo.description, icon: this._windowTitle.folderLocationInfo.icon?.id } : undefined,
 				isFilteredToUnread,
 				isFilteredToInProgress,
 				isFilteredToNeedsInput,
@@ -510,14 +527,14 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 		const isCompactMode = true;
 		pill.classList.toggle('compact-mode', isCompactMode);
 
-		// Left icon container (sparkle by default, report+count when attention needed, search on hover)
+		// Left icon container (sparkle by default, attention icon+count when attention needed, search on hover)
 		const leftIcon = $('span.agent-status-left-icon');
 		if (hasAttentionNeeded) {
-			// Show report icon + count when sessions need attention
-			const reportIcon = renderIcon(Codicon.report);
+			// Show attention icon + count when sessions need attention
+			const attentionIcon = renderIcon(Codicon.reportQuestion);
 			const countSpan = $('span.agent-status-attention-count');
 			countSpan.textContent = String(attentionNeededSessions.length);
-			reset(leftIcon, reportIcon, countSpan);
+			reset(leftIcon, attentionIcon, countSpan);
 			leftIcon.classList.add('has-attention');
 		} else {
 			reset(leftIcon, renderIcon(Codicon.searchSparkle));
@@ -545,7 +562,17 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 
 		const hoverLabel = localize('askAnythingPlaceholder', "Ask anything or describe what to build");
 
-		label.textContent = defaultLabel;
+		// While the folder is at an alternate location, the label shows the location layout
+		const folderLocation = !isCompactMode && progressText ? undefined : this._windowTitle.folderLocationInfo;
+		const commandCenterLabel = disposables.add(this.instantiationService.createInstance(CommandCenterLabel, label, getDefaultHoverDelegate('mouse')));
+		const showLabel = (text: string, location: IFolderLocation | undefined) => {
+			commandCenterLabel.update(text, location);
+			// The button's own name overrides its descendants, so it has to carry the location
+			inputArea.setAttribute('aria-label', location
+				? localize('openQuickAccessAtFolderLocation', "Open Quick Access, {0}", label.getAttribute('aria-label') ?? text)
+				: localize('openQuickAccess', "Open Quick Access"));
+		};
+		showLabel(defaultLabel, folderLocation);
 		inputArea.appendChild(label);
 
 		if (isCompactMode) {
@@ -571,14 +598,14 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 				disposables.add(addDisposableListener(inputArea, EventType.MOUSE_ENTER, () => {
 					reset(leftIcon, renderIcon(Codicon.searchSparkle));
 					leftIcon.classList.remove('has-attention');
-					label.textContent = hoverLabel;
+					showLabel(hoverLabel, undefined);
 					label.classList.remove('has-progress');
 					sendIcon.classList.remove('hidden');
 				}));
 
 				disposables.add(addDisposableListener(inputArea, EventType.MOUSE_LEAVE, () => {
 					reset(leftIcon, renderIcon(Codicon.searchSparkle));
-					label.textContent = defaultLabel;
+					showLabel(defaultLabel, folderLocation);
 					sendIcon.classList.add('hidden');
 				}));
 			}
@@ -855,34 +882,15 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 		const sparkleContainer = $('span.agent-status-badge-section.sparkle');
 		sparkleContainer.tabIndex = 0;
 
-		// Get menu actions for dropdown with proper group separators
-		const menuActions: IAction[] = Separator.join(...this._chatTitleBarMenu.getActions({ shouldForwardArgs: true }).map(([, actions]) => actions));
+		// Resolve menu actions lazily when the dropdown opens so that enablement (preconditions)
+		// and visibility reflect the current context rather than the state at render time
+		const menuActionsProvider = {
+			getActions: (): IAction[] => Separator.join(...this._chatTitleBarMenu.getActions({ shouldForwardArgs: true }).map(([, actions]) => actions))
+		};
 
-		// Determine primary action based on entitlement state
-		// Special case 1: User is signed out (needs to sign in)
-		// Special case 2: User has exceeded quota (needs to upgrade)
-		const chatSentiment = this.chatEntitlementService.sentiment;
-		const chatQuotaExceeded = this.chatEntitlementService.quotas.chat?.percentRemaining === 0;
-		const signedOut = this.chatEntitlementService.entitlement === ChatEntitlement.Unknown;
-		const anonymous = this.chatEntitlementService.anonymous;
-		const free = this.chatEntitlementService.entitlement === ChatEntitlement.Free;
-
-		let primaryActionId = TOGGLE_CHAT_ACTION_ID;
-		let primaryActionTitle = localize('toggleChat', "Toggle Chat");
-		let primaryActionIcon = Codicon.chatSparkle;
-
-		const signInTitleBarEnabled = this.configurationService.getValue<boolean>(ChatConfiguration.SignInTitleBarEnabled);
-		if (chatSentiment.completed && !chatSentiment.disabled) {
-			if (signedOut && !anonymous && !signInTitleBarEnabled) {
-				primaryActionId = CHAT_SETUP_ACTION_ID;
-				primaryActionTitle = localize('signInToChatSetup', "Sign in to use AI features...");
-				primaryActionIcon = Codicon.chatSparkleError;
-			} else if (chatQuotaExceeded && free) {
-				primaryActionId = OPEN_CHAT_QUOTA_EXCEEDED_DIALOG;
-				primaryActionTitle = localize('chatQuotaExceededButton', "GitHub Copilot Free plan chat messages quota reached. Click for details.");
-				primaryActionIcon = Codicon.chatSparkleWarning;
-			}
-		}
+		const primaryActionId = TOGGLE_CHAT_ACTION_ID;
+		const primaryActionTitle = localize('toggleChat', "Toggle Chat");
+		const primaryActionIcon = Codicon.chatSparkle;
 
 		// Create primary action
 		const primaryAction = this.instantiationService.createInstance(MenuItemAction, {
@@ -903,9 +911,9 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 			DropdownWithPrimaryActionViewItem,
 			primaryAction,
 			dropdownAction,
-			menuActions,
+			menuActionsProvider,
 			'agent-status-sparkle-dropdown',
-			{ skipTelemetry: true }
+			{ skipTelemetry: true, menuClassName: WORKBENCH_MENU_MOTION_CLASS, closeAnimation: workbenchMenuCloseAnimation }
 		);
 		sparkleDropdown.render(sparkleContainer);
 		disposables.add(sparkleDropdown);
@@ -1009,7 +1017,7 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 			needsInputSection.setAttribute('role', 'button');
 			needsInputSection.tabIndex = 0;
 			const needsInputIcon = $('span.agent-status-icon');
-			reset(needsInputIcon, renderIcon(Codicon.report));
+			reset(needsInputIcon, renderIcon(Codicon.reportQuestion));
 			needsInputSection.appendChild(needsInputIcon);
 			const needsInputCount = $('span.agent-status-text');
 			needsInputCount.textContent = String(attentionNeededSessions.length);
@@ -1029,8 +1037,8 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 			}));
 
 			const needsInputTooltip = attentionNeededSessions.length === 1
-				? localize('needsInputSessionsTooltip1', "{0} session needs input", attentionNeededSessions.length)
-				: localize('needsInputSessionsTooltip', "{0} sessions need input", attentionNeededSessions.length);
+				? localize('needsInputSessionsTooltip1', "{0} session needs attention", attentionNeededSessions.length)
+				: localize('needsInputSessionsTooltip', "{0} sessions need attention", attentionNeededSessions.length);
 			disposables.add(this.hoverService.setupManagedHover(hoverDelegate, needsInputSection, needsInputTooltip));
 		}
 
@@ -1127,13 +1135,21 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 	/**
 	 * Get the stored filter object from storage.
 	 */
-	private _getStoredFilter(): { providers: string[]; states: AgentSessionStatus[]; archived: boolean; read: boolean } | undefined {
+	private _getStoredFilter(): IStoredAgentSessionsFilter | undefined {
 		const filterStr = this.storageService.get(FILTER_STORAGE_KEY, StorageScope.PROFILE);
 		if (!filterStr) {
 			return undefined;
 		}
 		try {
-			return JSON.parse(filterStr);
+			const filter = JSON.parse(filterStr) as Partial<IStoredAgentSessionsFilter>;
+			return {
+				providers: filter.providers ?? [],
+				states: filter.states ?? [],
+				archived: filter.archived ?? true,
+				read: filter.read ?? false,
+				automation: filter.automation ?? true,
+				repositoryGroupCapped: filter.repositoryGroupCapped ?? true,
+			};
 		} catch {
 			return undefined;
 		}
@@ -1142,7 +1158,7 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 	/**
 	 * Store a filter object to storage.
 	 */
-	private _storeFilter(filter: { providers: string[]; states: AgentSessionStatus[]; archived: boolean; read: boolean }): void {
+	private _storeFilter(filter: IStoredAgentSessionsFilter): void {
 		this.storageService.store(FILTER_STORAGE_KEY, JSON.stringify(filter), StorageScope.PROFILE, StorageTarget.USER);
 	}
 
@@ -1154,7 +1170,9 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 			providers: [],
 			states: [],
 			archived: true,
-			read: false
+			read: false,
+			automation: true,
+			repositoryGroupCapped: true,
 		});
 	}
 
@@ -1210,6 +1228,8 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 		const currentFilter = this._getStoredFilter();
 		// Preserve existing provider filters (session type filters like Local, Background, etc.)
 		const preservedProviders = currentFilter?.providers ?? [];
+		const preservedAutomation = currentFilter?.automation ?? true;
+		const preservedRepositoryGroupCapped = currentFilter?.repositoryGroupCapped ?? true;
 
 		// Log telemetry for filter button clicks
 		const isToggleOff = (filterType === 'unread' && isFilteredToUnread)
@@ -1232,7 +1252,9 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 					providers: preservedProviders,
 					states: [],
 					archived: true,
-					read: true
+					read: true,
+					automation: preservedAutomation,
+					repositoryGroupCapped: preservedRepositoryGroupCapped,
 				});
 			} else if (filterType === 'inProgress') {
 				// Exclude Completed, Failed, and NeedsInput — show only InProgress
@@ -1240,7 +1262,9 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 					providers: preservedProviders,
 					states: [AgentSessionStatus.Completed, AgentSessionStatus.Failed, AgentSessionStatus.NeedsInput],
 					archived: true,
-					read: false
+					read: false,
+					automation: preservedAutomation,
+					repositoryGroupCapped: preservedRepositoryGroupCapped,
 				});
 			} else {
 				// Exclude Completed, Failed, and InProgress — show only NeedsInput
@@ -1248,7 +1272,9 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 					providers: preservedProviders,
 					states: [AgentSessionStatus.Completed, AgentSessionStatus.Failed, AgentSessionStatus.InProgress],
 					archived: true,
-					read: false
+					read: false,
+					automation: preservedAutomation,
+					repositoryGroupCapped: preservedRepositoryGroupCapped,
 				});
 			}
 			this._badgeFilterAppliedByThisWindow = filterType;
@@ -1386,29 +1412,7 @@ export class AgentTitleBarStatusWidget extends BaseActionViewItem {
 	 * Falls back to file name when tabs are hidden, or "Search" when empty.
 	 */
 	private _getLabel(): string {
-		const { prefix, suffix } = this._windowTitle.getTitleDecorations();
-
-		// Base label: custom title, workspace name, or file name when tabs are hidden
-		let label = this._windowTitle.workspaceName;
-		if (this._windowTitle.isCustomTitleFormat()) {
-			label = this._windowTitle.getWindowTitle();
-		} else if (!label && this.editorGroupsService.partOptions.showTabs === 'none') {
-			label = this._windowTitle.fileName ?? '';
-		}
-
-		if (!label) {
-			label = localize('agentStatusWidget.search', "Search");
-		}
-
-		// Apply prefix and suffix decorations
-		if (prefix) {
-			label = localize('label1', "{0} {1}", prefix, label);
-		}
-		if (suffix) {
-			label = localize('label2', "{0} {1}", label, suffix);
-		}
-
-		return label.replaceAll(/\r\n|\r|\n/g, '\u23CE');
+		return this._windowTitle.getCommandCenterLabel({ showFileName: this.editorGroupsService.partOptions.showTabs === 'none', fileNameAsFallback: true });
 	}
 
 	// #endregion
@@ -1428,7 +1432,8 @@ export class AgentTitleBarStatusRendering extends Disposable implements IWorkben
 		@IActionViewItemService actionViewItemService: IActionViewItemService,
 		@IInstantiationService instantiationService: IInstantiationService,
 		@IConfigurationService configurationService: IConfigurationService,
-		@IContextKeyService contextKeyService: IContextKeyService
+		@IContextKeyService contextKeyService: IContextKeyService,
+		@ITitleService titleService: ITitleService,
 	) {
 		super();
 
@@ -1436,7 +1441,7 @@ export class AgentTitleBarStatusRendering extends Disposable implements IWorkben
 			if (!(action instanceof SubmenuItemAction)) {
 				return undefined;
 			}
-			return instantiationService.createInstance(AgentTitleBarStatusWidget, action, options);
+			return instantiationService.createInstance(AgentTitleBarStatusWidget, action, titleService.windowTitle, options);
 		}, undefined));
 
 		// Add/remove CSS classes on workbench based on settings.
@@ -1448,7 +1453,7 @@ export class AgentTitleBarStatusRendering extends Disposable implements IWorkben
 
 		const updateClass = () => {
 			const commandCenterEnabled = configurationService.getValue<boolean>(LayoutSettings.COMMAND_CENTER) === true;
-			const statusMode = getAgentStatusSettingMode(configurationService);
+			const statusMode = getAgentStatusSettingMode(configurationService, contextKeyService);
 			const enabled = commandCenterEnabled && chatEnabled && statusMode !== 'hidden';
 			const enhanced = enabled && statusMode === 'compact';
 
@@ -1460,8 +1465,7 @@ export class AgentTitleBarStatusRendering extends Disposable implements IWorkben
 			if (
 				e.affectsConfiguration(ChatConfiguration.AgentStatusEnabled)
 				|| e.affectsConfiguration(LayoutSettings.COMMAND_CENTER)
-				|| e.affectsConfiguration(ChatConfiguration.AIDisabled)
-				|| e.affectsConfiguration(ChatConfiguration.ChatCustomizationMenuEnabled)
+				|| e.affectsConfiguration(ChatAIDisabledSettingId)
 				|| e.affectsConfiguration('disableAICustomizations')
 				|| e.affectsConfiguration('workbench.disableAICustomizations')
 			) {
@@ -1469,7 +1473,7 @@ export class AgentTitleBarStatusRendering extends Disposable implements IWorkben
 			}
 		}));
 		this._register(contextKeyService.onDidChangeContext(e => {
-			if (e.affectsSome(new Set(['chatIsEnabled']))) {
+			if (e.affectsSome(new Set(['chatIsEnabled', InEditorZenModeContext.key]))) {
 				chatEnabled = !!contextKeyService.getContextKeyValue<boolean>('chatIsEnabled');
 				updateClass();
 			}

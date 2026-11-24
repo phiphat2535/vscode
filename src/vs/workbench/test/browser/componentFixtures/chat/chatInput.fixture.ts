@@ -3,234 +3,30 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Emitter, Event } from '../../../../../base/common/event.js';
-import { observableValue } from '../../../../../base/common/observable.js';
+import * as dom from '../../../../../base/browser/dom.js';
+import { assert } from '../../../../../base/common/assert.js';
+import { Event } from '../../../../../base/common/event.js';
+import { MarkdownString } from '../../../../../base/common/htmlContent.js';
+import { constObservable, observableValue } from '../../../../../base/common/observable.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { mock } from '../../../../../base/test/common/mock.js';
-import { Codicon } from '../../../../../base/common/codicons.js';
-import { IMenuService, IMenu, MenuId, MenuItemAction, IMenuItem } from '../../../../../platform/actions/common/actions.js';
-import { ICommandService } from '../../../../../platform/commands/common/commands.js';
-import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
-import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
-import { ITextModelService } from '../../../../../editor/common/services/resolverService.js';
-import { IFileService } from '../../../../../platform/files/common/files.js';
-import { ISharedWebContentExtractorService } from '../../../../../platform/webContentExtractor/common/webContentExtractor.js';
-import { IDecorationsService } from '../../../../services/decorations/common/decorations.js';
-import { ITextFileService } from '../../../../services/textfile/common/textfiles.js';
-import { IExtensionService } from '../../../../services/extensions/common/extensions.js';
-import { IPathService } from '../../../../services/path/common/pathService.js';
-import { IChatWidgetHistoryService } from '../../../../contrib/chat/common/widget/chatWidgetHistoryService.js';
-import { IChatContextPickService } from '../../../../contrib/chat/browser/attachments/chatContextPickService.js';
-import { IWorkspaceContextService, IWorkspace } from '../../../../../platform/workspace/common/workspace.js';
-import { IViewDescriptorService } from '../../../../common/views.js';
-import { IChatWidget } from '../../../../contrib/chat/browser/chat.js';
-import { IAgentSessionsService } from '../../../../contrib/chat/browser/agentSessions/agentSessionsService.js';
-import { IChatAttachmentResolveService } from '../../../../contrib/chat/browser/attachments/chatAttachmentResolveService.js';
-import { IChatAttachmentWidgetRegistry } from '../../../../contrib/chat/browser/attachments/chatAttachmentWidgetRegistry.js';
-import { IChatContextService } from '../../../../contrib/chat/browser/contextContrib/chatContextService.js';
-import { ChatInputPart, IChatInputPartOptions, IChatInputStyles } from '../../../../contrib/chat/browser/widget/input/chatInputPart.js';
-import { IChatArtifacts, IChatArtifactsService } from '../../../../contrib/chat/common/tools/chatArtifactsService.js';
-import { ChatEditingSessionState, IChatEditingSession, IModifiedFileEntry, ModifiedFileEntryState } from '../../../../contrib/chat/common/editing/chatEditingService.js';
+import { SessionConfigKey } from '../../../../../platform/agentHost/common/sessionConfigKeys.js';
+import { ResolveSessionConfigResult } from '../../../../../platform/agentHost/common/state/protocol/commands.js';
+import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
+import { ChatEditingSessionState, emptySessionEntryDiff, IChatEditingSession, IModifiedFileEntry, ModifiedFileEntryState } from '../../../../contrib/chat/common/editing/chatEditingService.js';
 import { IChatRequestDisablement } from '../../../../contrib/chat/common/model/chatModel.js';
-import { IChatTodo, IChatTodoListService } from '../../../../contrib/chat/common/tools/chatTodoListService.js';
-import { ChatAgentLocation, ChatConfiguration } from '../../../../contrib/chat/common/constants.js';
-import { IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
-import { IChatModeService } from '../../../../contrib/chat/common/chatModes.js';
-import { IChatService } from '../../../../contrib/chat/common/chatService/chatService.js';
-import { IChatSessionsService } from '../../../../contrib/chat/common/chatSessionsService.js';
-import { ILanguageModelsService } from '../../../../contrib/chat/common/languageModels.js';
-import { IChatAgentService } from '../../../../contrib/chat/common/participants/chatAgents.js';
-import { ILanguageModelToolsService } from '../../../../contrib/chat/common/tools/languageModelToolsService.js';
-import { IWorkbenchAssignmentService } from '../../../../services/assignment/common/assignmentService.js';
-import { IEditorService } from '../../../../services/editor/common/editorService.js';
-import { IWorkbenchLayoutService } from '../../../../services/layout/browser/layoutService.js';
-import { IActionWidgetService } from '../../../../../platform/actionWidget/browser/actionWidget.js';
-import { IProductService } from '../../../../../platform/product/common/productService.js';
-import { IUpdateService, StateType } from '../../../../../platform/update/common/update.js';
-import { IUriIdentityService } from '../../../../../platform/uriIdentity/common/uriIdentity.js';
-import { IListService, ListService } from '../../../../../platform/list/browser/listService.js';
-import { INotebookDocumentService } from '../../../../services/notebook/common/notebookDocumentService.js';
-import { ISCMService } from '../../../../contrib/scm/common/scm.js';
-import { ComponentFixtureContext, createEditorServices, defineComponentFixture, defineThemedFixtureGroup, registerWorkbenchServices } from '../fixtureUtils.js';
+import { IChatTodo } from '../../../../contrib/chat/common/tools/chatTodoListService.js';
+import { ILanguageModelChatMetadataAndIdentifier } from '../../../../contrib/chat/common/languageModels.js';
+import { ChatAgentLocation } from '../../../../contrib/chat/common/constants.js';
+import { SessionType } from '../../../../contrib/chat/common/chatSessionsService.js';
+import { ChatInputNotificationSeverity, IChatInputNotification } from '../../../../contrib/chat/browser/widget/input/chatInputNotificationService.js';
+import { ChatInputNotificationWidget } from '../../../../contrib/chat/browser/widget/input/chatInputNotificationWidget.js';
+import { CopilotHarnessIntroductionButtonVariant, copilotHarnessIntroductionButtonVariants, CopilotHarnessIntroductionCopyVariant, copilotHarnessIntroductionCopyVariants, getCopilotHarnessIntroductionContent } from '../../../../contrib/chat/browser/agentSessions/copilotHarnessIntroduction.js';
+import { ComponentFixtureContext, createEditorServices, defineComponentFixture, defineThemedFixtureGroup } from '../fixtureUtils.js';
+import { registerChatFixtureServices } from './chatFixtureUtils.js';
+import { ChatInputFixtureOptions, renderChatInput } from './renderChatInput.js';
 
 import '../../../../contrib/chat/browser/widget/media/chat.css';
-
-class FixtureMenuService implements IMenuService {
-	declare readonly _serviceBrand: undefined;
-	private readonly _items = new Map<string, IMenuItem[]>();
-	constructor(
-		@IContextKeyService private readonly _contextKeyService: IContextKeyService,
-		@ICommandService private readonly _commandService: ICommandService,
-	) { }
-	addItem(menuId: MenuId, item: IMenuItem): void {
-		const key = menuId.id;
-		let items = this._items.get(key);
-		if (!items) {
-			items = [];
-			this._items.set(key, items);
-		}
-		items.push(item);
-	}
-	createMenu(id: MenuId): IMenu {
-		const actions: [string, MenuItemAction[]][] = [];
-		for (const item of this._items.get(id.id) ?? []) {
-			const group = item.group ?? '';
-			let entry = actions.find(a => a[0] === group);
-			if (!entry) {
-				entry = [group, []];
-				actions.push(entry);
-			}
-			entry[1].push(new MenuItemAction(item.command, item.alt, {}, undefined, undefined, this._contextKeyService, this._commandService));
-		}
-		return { onDidChange: Event.None, dispose() { }, getActions: () => actions };
-	}
-	getMenuActions() { return []; }
-	getMenuContexts() { return new Set<string>(); }
-	resetHiddenStates() { }
-}
-
-interface ChatInputFixtureOptions {
-	readonly artifacts?: readonly { label: string; uri: string; type: 'devServer' | 'screenshot' | 'plan' | undefined }[];
-	readonly editingSession?: IChatEditingSession;
-	readonly todos?: IChatTodo[];
-}
-
-async function renderChatInput(context: ComponentFixtureContext, fixtureOptions: ChatInputFixtureOptions = {}): Promise<void> {
-	const { container, disposableStore } = context;
-	const { artifacts = [], editingSession, todos = [] } = fixtureOptions;
-	const artifactsObs = observableValue<readonly typeof artifacts[number][]>('artifacts', artifacts);
-
-	const instantiationService = createEditorServices(disposableStore, {
-		colorTheme: context.theme,
-		additionalServices: (reg) => {
-			reg.define(IMenuService, FixtureMenuService);
-			registerWorkbenchServices(reg);
-			// eslint-disable-next-line local/code-no-dangerous-type-assertions
-			reg.defineInstance(ITextModelService, new class extends mock<ITextModelService>() { override async createModelReference() { return { object: { textEditorModel: null }, dispose() { } } as unknown as Awaited<ReturnType<ITextModelService['createModelReference']>>; } }());
-			reg.defineInstance(IDecorationsService, new class extends mock<IDecorationsService>() { override onDidChangeDecorations = Event.None; }());
-			reg.defineInstance(ITextFileService, new class extends mock<ITextFileService>() { override readonly untitled = new class extends mock<ITextFileService['untitled']>() { override readonly onDidChangeLabel = Event.None; }(); }());
-			reg.defineInstance(ILanguageModelsService, new class extends mock<ILanguageModelsService>() { override onDidChangeLanguageModels = Event.None; override getLanguageModelIds() { return []; } }());
-			reg.defineInstance(IFileService, new class extends mock<IFileService>() { override onDidFilesChange = Event.None; override onDidRunOperation = Event.None; }());
-			reg.defineInstance(IEditorService, new class extends mock<IEditorService>() { override onDidActiveEditorChange = Event.None; }());
-			reg.defineInstance(IChatAgentService, new class extends mock<IChatAgentService>() { override onDidChangeAgents = Event.None; override getAgents() { return []; } override getActivatedAgents() { return []; } }());
-			reg.defineInstance(ISharedWebContentExtractorService, new class extends mock<ISharedWebContentExtractorService>() { }());
-			reg.defineInstance(IWorkbenchAssignmentService, new class extends mock<IWorkbenchAssignmentService>() { override async getCurrentExperiments() { return []; } override async getTreatment() { return undefined; } override onDidRefetchAssignments = Event.None; }());
-			reg.defineInstance(IChatEntitlementService, new class extends mock<IChatEntitlementService>() { }());
-			reg.defineInstance(IChatModeService, new class extends mock<IChatModeService>() { override readonly onDidChangeChatModes = Event.None; override getModes() { return { builtin: [], custom: [] }; } override findModeById() { return undefined; } }());
-			reg.defineInstance(ILanguageModelToolsService, new class extends mock<ILanguageModelToolsService>() { override onDidChangeTools = Event.None; override getTools() { return []; } }());
-			reg.defineInstance(IChatService, new class extends mock<IChatService>() { override onDidSubmitRequest = Event.None; }());
-			reg.defineInstance(IChatSessionsService, new class extends mock<IChatSessionsService>() { override getAllChatSessionContributions() { return []; } override readonly onDidChangeSessionOptions = Event.None; override readonly onDidChangeOptionGroups = Event.None; override readonly onDidChangeAvailability = Event.None; }());
-			reg.defineInstance(IChatContextService, new class extends mock<IChatContextService>() { }());
-			reg.defineInstance(IAgentSessionsService, new class extends mock<IAgentSessionsService>() { override readonly model = new class extends mock<IAgentSessionsService['model']>() { override readonly onDidChangeSessions = Event.None; }(); }());
-			reg.defineInstance(IWorkspaceContextService, new class extends mock<IWorkspaceContextService>() { override onDidChangeWorkspaceFolders = Event.None; override getWorkspace(): IWorkspace { return { id: '', folders: [], configuration: undefined }; } }());
-			reg.defineInstance(IWorkbenchLayoutService, new class extends mock<IWorkbenchLayoutService>() { override onDidChangePartVisibility = Event.None; override onDidChangeWindowMaximized = Event.None; override isVisible() { return true; } }());
-			reg.defineInstance(IViewDescriptorService, new class extends mock<IViewDescriptorService>() { override onDidChangeLocation = Event.None; }());
-			reg.defineInstance(IChatAttachmentWidgetRegistry, new class extends mock<IChatAttachmentWidgetRegistry>() { }());
-			reg.defineInstance(IChatAttachmentResolveService, new class extends mock<IChatAttachmentResolveService>() { }());
-			reg.defineInstance(IExtensionService, new class extends mock<IExtensionService>() { override readonly onDidChangeExtensions = Event.None; }());
-			reg.defineInstance(IPathService, new class extends mock<IPathService>() { }());
-			reg.defineInstance(IChatWidgetHistoryService, new class extends mock<IChatWidgetHistoryService>() { override getHistory() { return []; } override readonly onDidChangeHistory = Event.None; }());
-			reg.defineInstance(IChatContextPickService, new class extends mock<IChatContextPickService>() { }());
-			reg.defineInstance(IListService, new ListService());
-			reg.defineInstance(INotebookDocumentService, new class extends mock<INotebookDocumentService>() { }());
-			reg.defineInstance(ISCMService, new class extends mock<ISCMService>() {
-				override readonly onDidAddRepository = Event.None;
-				override readonly onDidRemoveRepository = Event.None;
-				override readonly repositories = [];
-				override readonly repositoryCount = 0;
-			}());
-			reg.defineInstance(IActionWidgetService, new class extends mock<IActionWidgetService>() { override show() { } override hide() { } override get isVisible() { return false; } }());
-			reg.defineInstance(IProductService, new class extends mock<IProductService>() { }());
-			reg.defineInstance(IUpdateService, new class extends mock<IUpdateService>() { override onStateChange = Event.None; override get state() { return { type: StateType.Uninitialized as const }; } }());
-			reg.defineInstance(IUriIdentityService, new class extends mock<IUriIdentityService>() { }());
-			reg.defineInstance(IChatArtifactsService, new class extends mock<IChatArtifactsService>() {
-				override getArtifacts(): IChatArtifacts {
-					const mutableObs = observableValue<boolean>('mutable', true);
-					return new class extends mock<IChatArtifacts>() {
-						override readonly artifacts = artifactsObs;
-						override readonly mutable = mutableObs;
-						override set() { }
-						override clear() { }
-						override migrate() { }
-					}();
-				}
-			}());
-			reg.defineInstance(IChatTodoListService, new class extends mock<IChatTodoListService>() {
-				override readonly onDidUpdateTodos = Event.None;
-				override getTodos() { return [...todos]; }
-				override setTodos() { }
-				override migrateTodos() { }
-			}());
-		},
-	});
-
-	if (artifacts.length > 0) {
-		const configService = instantiationService.get(IConfigurationService) as TestConfigurationService;
-		await configService.setUserConfiguration(ChatConfiguration.ArtifactsEnabled, true);
-	}
-
-	container.style.width = '500px';
-	container.style.backgroundColor = 'var(--vscode-sideBar-background, var(--vscode-editor-background))';
-	container.classList.add('monaco-workbench');
-
-	const session = document.createElement('div');
-	session.classList.add('interactive-session');
-	container.appendChild(session);
-
-	const menuService = instantiationService.get(IMenuService) as FixtureMenuService;
-	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.attachContext', title: '+', icon: Codicon.add }, group: 'navigation', order: -1 });
-	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.openModePicker', title: 'Agent' }, group: 'navigation', order: 1 });
-	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.openModelPicker', title: 'GPT-5.3-Codex' }, group: 'navigation', order: 3 });
-	menuService.addItem(MenuId.ChatInput, { command: { id: 'workbench.action.chat.configureTools', title: '', icon: Codicon.settingsGear }, group: 'navigation', order: 100 });
-	menuService.addItem(MenuId.ChatExecute, { command: { id: 'workbench.action.chat.submit', title: 'Send', icon: Codicon.arrowUp }, group: 'navigation', order: 4 });
-	menuService.addItem(MenuId.ChatInputSecondary, { command: { id: 'workbench.action.chat.openSessionTargetPicker', title: 'Local' }, group: 'navigation', order: 0 });
-	menuService.addItem(MenuId.ChatInputSecondary, { command: { id: 'workbench.action.chat.openPermissionPicker', title: 'Default Approvals' }, group: 'navigation', order: 10 });
-
-	const options: IChatInputPartOptions = {
-		renderFollowups: false,
-		renderInputToolbarBelowInput: false,
-		renderWorkingSet: !!editingSession,
-		menus: { executeToolbar: MenuId.ChatExecute, telemetrySource: 'fixture' },
-		widgetViewKindTag: 'view',
-		inputEditorMinLines: 2,
-	};
-	const styles: IChatInputStyles = {
-		overlayBackground: 'var(--vscode-editor-background)',
-		listForeground: 'var(--vscode-foreground)',
-		listBackground: 'var(--vscode-editor-background)',
-	};
-
-	try {
-		const inputPart = disposableStore.add(instantiationService.createInstance(ChatInputPart, ChatAgentLocation.Chat, options, styles, false));
-		const mockWidget = new class extends mock<IChatWidget>() {
-			override readonly onDidChangeViewModel = new Emitter<never>().event;
-			override readonly viewModel = undefined;
-			override readonly contribs = [];
-			override readonly location = ChatAgentLocation.Chat;
-			override readonly viewContext = {};
-		}();
-
-		inputPart.render(session, '', mockWidget);
-		inputPart.layout(500);
-		await new Promise(r => setTimeout(r, 100));
-		inputPart.layout(500);
-		inputPart.renderArtifactsWidget(URI.parse('chat-session:test-session'));
-		await inputPart.renderChatTodoListWidget(URI.parse('chat-session:test-session'));
-		await new Promise(r => setTimeout(r, 50));
-
-		if (editingSession) {
-			inputPart.renderChatEditingSessionState(editingSession);
-			await new Promise(r => setTimeout(r, 50));
-			inputPart.layout(500);
-		}
-	} catch (e) {
-		const err = document.createElement('pre');
-		err.style.cssText = 'color:red;font-size:11px;white-space:pre-wrap';
-		err.textContent = `Render error: ${e instanceof Error ? e.message : String(e)}`;
-		session.appendChild(err);
-	}
-}
 
 const sampleArtifacts = [
 	{ label: 'Dev Server', uri: 'http://localhost:3000', type: 'devServer' as const },
@@ -260,12 +56,19 @@ function createMockEditingSession(files: { uri: string; added: number; removed: 
 	});
 
 	return new class extends mock<IChatEditingSession>() {
-		override readonly isGlobalEditingSession = false;
+		override readonly isGlobalEditingSession = constObservable(false);
 		override readonly chatSessionResource = URI.parse('chat-session:test-session');
 		override readonly onDidDispose = Event.None;
 		override readonly state = observableValue('state', ChatEditingSessionState.Idle);
 		override readonly entries = observableValue('entries', entries);
 		override readonly requestDisablement = observableValue<IChatRequestDisablement[]>('requestDisablement', []);
+		override getDiffsForFilesInSession() {
+			return constObservable(files.map(file => ({
+				...emptySessionEntryDiff(URI.parse(file.uri), URI.parse(file.uri)),
+				added: file.added,
+				removed: file.removed,
+			})));
+		}
 	}();
 }
 
@@ -275,11 +78,295 @@ const sampleTodos: IChatTodo[] = [
 	{ id: 3, title: 'Add unit tests', status: 'not-started' },
 ];
 
+const sampleModels: ILanguageModelChatMetadataAndIdentifier[] = [
+	{
+		identifier: 'openai-gpt-5.3-codex',
+		metadata: {
+			extension: new ExtensionIdentifier('fixture.extension'),
+			id: 'gpt-5.3-codex',
+			name: 'GPT-5.3-Codex',
+			vendor: 'openai',
+			family: 'gpt',
+			version: '1',
+			maxInputTokens: 128000,
+			maxOutputTokens: 4096,
+			isDefaultForLocation: { [ChatAgentLocation.Chat]: true },
+		},
+	},
+];
+
+// A short name beside its thinking effort / context readout. The name must keep its
+// own width rather than being padded out to the picker's minimum label width.
+export const shortNameModels: ILanguageModelChatMetadataAndIdentifier[] = [
+	{
+		identifier: 'xai-grok-4.7',
+		metadata: {
+			extension: new ExtensionIdentifier('fixture.extension'),
+			id: 'grok-4.7',
+			name: 'Grok 4.7',
+			vendor: 'xai',
+			family: 'grok',
+			version: '1',
+			maxInputTokens: 256000,
+			maxOutputTokens: 8192,
+			isDefaultForLocation: { [ChatAgentLocation.Chat]: true },
+			configurationSchema: {
+				properties: {
+					reasoningEffort: { type: 'string', group: 'navigation', enum: ['low', 'medium', 'high'], enumItemLabels: ['Low', 'Medium', 'High'], default: 'high' },
+					contextSize: { type: 'number', group: 'tokens', enum: [128000, 256000], enumItemLabels: ['128K', '256K'], default: 256000 },
+				},
+			},
+		},
+	},
+];
+
+const sampleNotification: IChatInputNotification = {
+	id: 'fixture.notification',
+	severity: ChatInputNotificationSeverity.Info,
+	message: 'You are approaching your monthly limit.',
+	description: undefined,
+	actions: [],
+	dismissible: true,
+	autoDismissOnMessage: false,
+};
+
+function createCopilotIntroductionNotification(copy: CopilotHarnessIntroductionCopyVariant = 'current', buttons: CopilotHarnessIntroductionButtonVariant = 'dismiss'): IChatInputNotification {
+	const content = getCopilotHarnessIntroductionContent(copy, buttons);
+	return {
+		id: 'chat.agentsParallelWork',
+		severity: ChatInputNotificationSeverity.Info,
+		message: content.title,
+		description: new MarkdownString(content.description),
+		actions: content.actions,
+		dismissible: content.dismissible,
+		autoDismissOnMessage: false,
+	};
+}
+
+const copilotHarnessSessionConfig: ResolveSessionConfigResult = {
+	schema: {
+		type: 'object',
+		properties: {
+			[SessionConfigKey.Mode]: {
+				type: 'string',
+				title: 'Mode',
+				enum: ['interactive', 'autopilot'],
+				enumLabels: ['Agent', 'Autopilot'],
+				default: 'interactive',
+			},
+			[SessionConfigKey.AutoApprove]: {
+				type: 'string',
+				title: 'Permissions',
+				enum: ['default', 'autoApprove', 'autopilot'],
+				enumLabels: ['Default permissions', 'Allow all', 'Autopilot'],
+				default: 'default',
+			},
+		},
+	},
+	values: {
+		[SessionConfigKey.Mode]: 'interactive',
+		[SessionConfigKey.AutoApprove]: 'default',
+	},
+};
+
+function sandboxPlaceholderOptions(enabled: boolean): ChatInputFixtureOptions {
+	return {
+		width: 660,
+		placeholder: 'Chat with Copilot [windows-ca-test-sunday1234]',
+		agentHostSessionConfig: {
+			schema: {
+				type: 'object', properties: {
+					...copilotHarnessSessionConfig.schema.properties,
+					[SessionConfigKey.SandboxEnabled]: { type: 'string', title: 'Sandbox', enum: ['default', 'on', 'off'], sessionMutable: true },
+				}
+			},
+			values: { ...copilotHarnessSessionConfig.values, [SessionConfigKey.SandboxEnabled]: enabled ? 'on' : 'off' },
+		},
+	};
+}
+
+const copilotHarnessModels = sampleModels.map(model => ({ ...model, metadata: { ...model.metadata, targetChatSessionType: SessionType.AgentHostCopilot } }));
+
+const combinedPickerOptions: ChatInputFixtureOptions = {
+	agentHostSessionConfig: { ...copilotHarnessSessionConfig, values: { mode: 'autopilot', autoApprove: 'autoApprove' } },
+	combinedModePermissionsPicker: true,
+	models: shortNameModels.map(model => ({ ...model, metadata: { ...model.metadata, targetChatSessionType: SessionType.AgentHostCopilot } })),
+};
+
+const copilotIntroductionOptions: ChatInputFixtureOptions = {
+	agentHostSessionConfig: copilotHarnessSessionConfig,
+	models: copilotHarnessModels,
+	notification: createCopilotIntroductionNotification(),
+};
+
+function renderCopilotIntroductionComparison(context: ComponentFixtureContext): void {
+	const { container, disposableStore } = context;
+	const width = 500;
+	container.classList.add('monaco-workbench', 'copilot-introduction-comparison');
+	container.style.display = 'grid';
+	container.style.gridTemplateColumns = `repeat(2, ${width}px)`;
+	container.style.width = 'max-content';
+	container.style.gap = 'var(--vscode-spacing-size240)';
+	container.style.padding = 'var(--vscode-spacing-size160)';
+	container.style.backgroundColor = 'var(--vscode-editor-background)';
+	container.style.color = 'var(--vscode-foreground)';
+	for (const copy of copilotHarnessIntroductionCopyVariants) {
+		for (const buttons of copilotHarnessIntroductionButtonVariants) {
+			const card = dom.append(container, dom.$('section.copilot-introduction-comparison-card'));
+			card.dataset.copy = copy;
+			card.dataset.buttons = buttons;
+			const heading = dom.append(card, dom.$('h3'));
+			heading.textContent = `${copy} / ${buttons === 'dismiss' ? 'X + two buttons' : 'original feedback buttons'}`;
+			heading.style.margin = '0 0 var(--vscode-spacing-size80)';
+			heading.style.fontSize = 'var(--vscode-fontSize-body1)';
+			heading.style.fontWeight = 'var(--vscode-fontWeight-semiBold)';
+			const instantiationService = createEditorServices(disposableStore, {
+				colorTheme: context.theme,
+				additionalServices: reg => registerChatFixtureServices(reg, { notification: createCopilotIntroductionNotification(copy, buttons) }),
+			});
+			const widget = disposableStore.add(instantiationService.createInstance(ChatInputNotificationWidget, undefined));
+			dom.append(card, widget.domNode);
+		}
+	}
+}
+
 export default defineThemedFixtureGroup({ path: 'chat/input/' }, {
 	Default: defineComponentFixture({ render: context => renderChatInput(context) }),
+	WithSandboxing: defineComponentFixture({ render: context => renderChatInput(context, { sandboxingEnabled: true }) }),
+	SessionSandboxEnabled: defineComponentFixture({ render: context => renderChatInput(context, sandboxPlaceholderOptions(true)) }),
+	SessionSandboxDisabled: defineComponentFixture({ render: context => renderChatInput(context, sandboxPlaceholderOptions(false)) }),
+	SessionSandboxOverflow: defineComponentFixture({
+		virtualTime: { enabled: false },
+		render: async context => {
+			await renderChatInput(context, { ...sandboxPlaceholderOptions(true), placeholder: 'Chat', resizeWidths: [80] });
+			assert(!context.container.querySelector('.agent-host-chat-input-picker-host-autoApprove'), 'Permissions should be in overflow.');
+			assert(context.container.querySelector('.editorPlaceholder')?.textContent === 'Chat (sandbox enabled)', 'Overflow must not hide sandbox status.');
+		},
+	}),
+	WithProviderIcon: defineComponentFixture({ render: context => renderChatInput(context, { models: sampleModels }) }),
+	WithShortModelName: defineComponentFixture({ render: context => renderChatInput(context, { models: shortNameModels }) }),
+	CompactWithProviderIcon: defineComponentFixture({
+		labels: { kind: 'screenshot', blocksCi: true },
+		expectedVisualDescriptions: ['The editor chat input shows compact picker controls as 12-pixel codicons centered with equal padding inside matching 22-pixel square controls, aligned with the expanded toolbar height.'],
+		render: context => renderChatInput(context, { models: sampleModels, width: 180 })
+	}),
+	CopilotHarnessCompactPickers: defineComponentFixture({
+		labels: { kind: 'screenshot', blocksCi: true },
+		expectedVisualDescriptions: ['The editor chat input renders the real Copilot Agent Host mode and permissions pickers in compact state. Each compact icon is centered with equal padding inside a 22-pixel square control.'],
+		render: context => renderChatInput(context, { agentHostSessionConfig: copilotHarnessSessionConfig, width: 500, resizeWidths: [180] }),
+	}),
+	CopilotHarnessCombinedPickers: defineComponentFixture({
+		virtualTime: { enabled: false },
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, combinedPickerOptions),
+	}),
+	CopilotHarnessCombinedCompactPickers: defineComponentFixture({
+		virtualTime: { enabled: false },
+		render: context => renderChatInput(context, {
+			...combinedPickerOptions,
+			width: 500,
+			resizeWidths: [180],
+		}),
+	}),
 	WithArtifacts: defineComponentFixture({ render: context => renderChatInput(context, { artifacts: sampleArtifacts }) }),
+	// The notice/input seam, the subject of #330483. Driven through the real
+	// notification service so the squared corner comes from the stack.
+	WithNotification: defineComponentFixture({
+		render: context => renderChatInput(context, { notification: sampleNotification })
+	}),
+	WithCopilotIntroduction: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, copilotIntroductionOptions)
+	}),
+	NarrowWithCopilotIntroduction: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, { ...copilotIntroductionOptions, width: 320 })
+	}),
+	NarrowWithCopilotIntroductionFeedback: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, { ...copilotIntroductionOptions, notification: createCopilotIntroductionNotification('current', 'feedback'), width: 320 })
+	}),
+	CopilotIntroductionExperiments: defineThemedFixtureGroup(Object.fromEntries(
+		copilotHarnessIntroductionCopyVariants.flatMap(copy => copilotHarnessIntroductionButtonVariants.map(buttons => [
+			`${copy}-${buttons}`,
+			defineComponentFixture({
+				render: context => renderChatInput(context, { ...copilotIntroductionOptions, notification: createCopilotIntroductionNotification(copy, buttons) })
+			}),
+		] as const))
+	)),
+	AllCopilotIntroductionVariants: defineComponentFixture({
+		render: renderCopilotIntroductionComparison,
+	}),
+	// A run of three: notice, todo list, then the input. Covers a notice docking
+	// to a widget rather than straight to the input.
+	WithNotificationAndTodos: defineComponentFixture({
+		render: context => renderChatInput(context, { notification: sampleNotification, todos: sampleTodos })
+	}),
 	WithFileChanges: defineComponentFixture({
 		render: context => renderChatInput(context, { editingSession: createMockEditingSession([{ uri: 'file:///workspace/src/fibon.ts', added: 21, removed: 1 }]) })
+	}),
+	WithSessionWorkingSet: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, {
+			sessionWorkingSet: true,
+			editingSession: createMockEditingSession([
+				{ uri: 'file:///workspace/src/fibonacci.ts', added: 21, removed: 1 },
+				{ uri: 'file:///workspace/src/fibonacci.test.ts', added: 123, removed: 12 },
+				{ uri: 'file:///workspace/README.md', added: 4, removed: 0 },
+			]),
+		})
+	}),
+	WithSessionWorkingSetNarrow: defineComponentFixture({
+		render: context => renderChatInput(context, {
+			width: 320,
+			sessionWorkingSet: true,
+			editingSession: createMockEditingSession([
+				{ uri: 'file:///workspace/src/components/long-component-name.ts', added: 1234, removed: 321 },
+				{ uri: 'file:///workspace/src/components/long-component-name.test.ts', added: 35, removed: 2 },
+			]),
+		})
+	}),
+	WithNotificationAndSessionWorkingSet: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, {
+			notification: sampleNotification,
+			sessionWorkingSet: true,
+			editingSession: createMockEditingSession([{ uri: 'file:///workspace/src/math.ts', added: 8, removed: 0 }]),
+		}),
+	}),
+	FocusedWithNotificationAndSessionWorkingSet: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, {
+			notification: sampleNotification,
+			sessionWorkingSet: true,
+			focusInput: true,
+			editingSession: createMockEditingSession([{ uri: 'file:///workspace/src/math.ts', added: 8, removed: 0 }]),
+		}),
+	}),
+	FocusedWithSessionWorkingSet: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, {
+			sessionWorkingSet: true,
+			focusInput: true,
+			editingSession: createMockEditingSession([{ uri: 'file:///workspace/src/math.ts', added: 8, removed: 0 }]),
+		}),
+	}),
+	WithSessionWorkingSetReviewDisabled: defineComponentFixture({
+		render: context => renderChatInput(context, {
+			sessionWorkingSet: true,
+			sessionWorkingSetReviewEnabled: false,
+			editingSession: createMockEditingSession([{ uri: 'file:///workspace/src/math.ts', added: 8, removed: 0 }]),
+		}),
+	}),
+	WithSessionWorkingSetOverflow: defineComponentFixture({
+		render: context => renderChatInput(context, {
+			sessionWorkingSet: true,
+			editingSession: createMockEditingSession(Array.from({ length: 9 }, (_, index) => ({
+				uri: `file:///workspace/src/file${index + 1}.ts`,
+				added: index + 1,
+				removed: index,
+			}))),
+		})
 	}),
 	WithTodos: defineComponentFixture({
 		render: context => renderChatInput(context, { todos: sampleTodos })
@@ -296,5 +383,62 @@ export default defineThemedFixtureGroup({ path: 'chat/input/' }, {
 			editingSession: createMockEditingSession([{ uri: 'file:///workspace/src/fibon.ts', added: 21, removed: 1 }]),
 			todos: sampleTodos,
 		})
+	}),
+	// Standalone dictation / Voice Mode controls, shown when the segmented voice
+	// pill isn't active. Each state changes part of the border / color / glow
+	// cascade, so they are covered individually.
+	VoiceDictationIdle: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'dictationIdle' }) }),
+	VoiceDictationRecording: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'dictationRecording' }) }),
+	VoiceDictationPreparing: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'dictationPreparing' }) }),
+	VoiceModeIdle: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'voiceIdle' }) }),
+	VoiceModeConnecting: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'voiceConnecting' }) }),
+	VoiceModeListening: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'voiceListening' }) }),
+	VoiceModeSpeaking: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'voiceSpeaking' }) }),
+	VoiceModeDisconnect: defineComponentFixture({ render: context => renderChatInput(context, { voiceControl: 'voiceDisconnect' }) }),
+	VoiceDictationFocused: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, { voiceControl: 'dictationIdle', focusVoiceControl: 'dictation' }),
+	}),
+	VoiceModeFocused: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, { voiceControl: 'voiceIdle', focusVoiceControl: 'voice' }),
+	}),
+	VoiceInputModeDictationFocused: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, { voiceInputMode: true, focusVoiceControl: 'dictation' }),
+	}),
+	VoiceInputModeVoiceFocused: defineComponentFixture({
+		additionalThemes: ['darkHighContrast', 'lightHighContrast'],
+		render: context => renderChatInput(context, { voiceInputMode: true, focusVoiceControl: 'voice' }),
+	}),
+	// The segmented voice pill at the chat view's minimum width: the pickers
+	// collapse into the overflow menu so the send button and the voice pill stay
+	// inside the input (#331228).
+	NarrowWithVoiceInputMode: defineComponentFixture({
+		virtualTime: { enabled: false },
+		render: async context => {
+			await renderChatInput(context, { voiceInputMode: true, width: 150 });
+			const inputContainer = context.container.querySelector<HTMLElement>('.chat-input-container');
+			const inputToolbar = context.container.querySelector<HTMLElement>('.chat-input-toolbar');
+			const submit = context.container.querySelector<HTMLElement>('.chat-execute-toolbar .chat-submit-button');
+			assert(!!inputContainer && !!inputToolbar && !!submit && submit.checkVisibility());
+			const submitOverflow = submit.getBoundingClientRect().right - inputContainer.getBoundingClientRect().right;
+			assert(submitOverflow <= 0, `The send button must not overflow the chat input, got ${submitOverflow}px of overflow.`);
+			const inputToolbarRight = inputToolbar.getBoundingClientRect().right;
+			for (const item of inputToolbar.querySelectorAll<HTMLElement>('.action-item')) {
+				assert(item.getBoundingClientRect().right <= inputToolbarRight + 1, 'Input toolbar actions must move into the overflow menu instead of being clipped.');
+			}
+			assert(!!inputToolbar.querySelector('.monaco-action-bar.has-overflow'), 'The collapsed pickers must stay reachable from the overflow menu.');
+		},
+	}),
+
+	// Where the pet lands, with and without a notice docked above the input (#332570).
+	WithPet: defineComponentFixture({ render: context => renderChatInput(context, { pet: true }) }),
+	WithPetAndNotification: defineComponentFixture({
+		render: context => renderChatInput(context, { pet: true, notification: sampleNotification })
+	}),
+	// Notification and todo list are separate stack members, so they genuinely coexist.
+	WithPetAndNotificationAndTodos: defineComponentFixture({
+		render: context => renderChatInput(context, { pet: true, notification: sampleNotification, todos: sampleTodos })
 	}),
 });

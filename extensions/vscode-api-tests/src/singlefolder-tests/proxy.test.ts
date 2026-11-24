@@ -8,16 +8,9 @@ import 'mocha';
 import { assertNoRpc } from '../utils';
 import { pki } from 'node-forge';
 import { AddressInfo } from 'net';
-import { resetCaches } from '@vscode/proxy-agent';
 import * as vscode from 'vscode';
 import { Straightforward, Middleware, RequestContext, ConnectContext, isRequest, isConnect } from 'straightforward';
 import assert from 'assert';
-
-declare module 'https' {
-	interface Agent {
-		testCertificates?: string[];
-	}
-}
 
 (vscode.env.uiKind === vscode.UIKind.Web ? suite.skip : suite)('vscode API - network proxy support', () => {
 
@@ -61,14 +54,10 @@ declare module 'https' {
 			rejectPort(err);
 		});
 
-		// Using https.globalAgent because it is shared with proxyResolver.ts and mutable.
-		https.globalAgent.testCertificates = [certPEM];
-		resetCaches();
-
 		try {
 			const portNumber = await port;
 			await new Promise<void>((resolve, reject) => {
-				https.get(`https://127.0.0.1:${portNumber}`, { servername: 'localhost-proxy-test' }, res => {
+				https.get(`https://127.0.0.1:${portNumber}`, { servername: 'localhost-proxy-test', testCertificates: [certPEM] } as https.RequestOptions, res => {
 					if (res.statusCode === 200) {
 						resolve();
 					} else {
@@ -78,8 +67,6 @@ declare module 'https' {
 					.on('error', reject);
 			});
 		} finally {
-			delete https.globalAgent.testCertificates;
-			resetCaches();
 			server.close();
 		}
 	});
@@ -113,6 +100,10 @@ declare module 'https' {
 			await proxyListen;
 			const proxyPort = (sf.server.address() as AddressInfo).port;
 
+			// A CI agent's NO_PROXY may list the test URL. Any http.noProxy entry makes the proxy resolver ignore NO_PROXY.
+			const noProxyChange = waitForConfigChange('http.noProxy');
+			await vscode.workspace.getConfiguration().update('http.noProxy', ['proxy-test.invalid'], vscode.ConfigurationTarget.Global);
+			await noProxyChange;
 			const change = waitForConfigChange('http.proxy');
 			await vscode.workspace.getConfiguration().update('http.proxy', `http://127.0.0.1:${proxyPort}`, vscode.ConfigurationTarget.Global);
 			await change;
@@ -155,6 +146,7 @@ declare module 'https' {
 			const change = waitForConfigChange('http.proxy');
 			await vscode.workspace.getConfiguration().update('http.proxy', undefined, vscode.ConfigurationTarget.Global);
 			await change;
+			await vscode.workspace.getConfiguration().update('http.noProxy', undefined, vscode.ConfigurationTarget.Global);
 			await vscode.workspace.getConfiguration().update('integration-test.http.proxyAuth', undefined, vscode.ConfigurationTarget.Global);
 		}
 	});

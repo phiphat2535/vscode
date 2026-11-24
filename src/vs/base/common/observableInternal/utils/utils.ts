@@ -66,6 +66,57 @@ export function debouncedObservable<T>(observable: IObservable<T>, debounceMs: n
 		return {
 			dispose() {
 				d.dispose();
+				if (timeout !== undefined) {
+					clearTimeout(timeout);
+					timeout = undefined;
+				}
+				hasValue = false;
+				lastValue = undefined;
+			},
+		};
+	}, () => {
+		if (hasValue) {
+			return lastValue!;
+		} else {
+			return observable.get();
+		}
+	}, debugLocation);
+}
+
+/**
+ * Creates an observable that throttles the input observable.
+ * Unlike {@link debouncedObservable}, the timer starts on the first change
+ * and is not reset by subsequent changes, preventing starvation.
+ */
+export function throttledObservable<T>(observable: IObservable<T>, throttleMs: number, debugLocation = DebugLocation.ofCaller()): IObservable<T> {
+	let hasValue = false;
+	let lastValue: T | undefined;
+
+	let timeout: Timeout | undefined = undefined;
+
+	return observableFromEvent<T, void>(undefined, cb => {
+		const d = autorun(reader => {
+			const value = observable.read(reader);
+
+			if (!hasValue) {
+				hasValue = true;
+				lastValue = value;
+			} else if (!timeout) {
+				// Only start a timer if one isn't already running
+				timeout = setTimeout(() => {
+					timeout = undefined;
+					lastValue = observable.read(undefined);
+					cb();
+				}, throttleMs);
+			}
+		});
+		return {
+			dispose() {
+				d.dispose();
+				if (timeout) {
+					clearTimeout(timeout);
+					timeout = undefined;
+				}
 				hasValue = false;
 				lastValue = undefined;
 			},

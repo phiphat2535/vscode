@@ -30,10 +30,9 @@ import { CodeEditorWidget } from '../../../../editor/browser/widget/codeEditor/c
 import { EditorOption } from '../../../../editor/common/config/editorOptions.js';
 import { EDITOR_FONT_DEFAULTS } from '../../../../editor/common/config/fontInfo.js';
 import { Position } from '../../../../editor/common/core/position.js';
-import { Range } from '../../../../editor/common/core/range.js';
 import { IDecorationOptions } from '../../../../editor/common/editorCommon.js';
 import { EditorContextKeys } from '../../../../editor/common/editorContextKeys.js';
-import { CompletionContext, CompletionItem, CompletionItemInsertTextRule, CompletionItemKind, CompletionItemKinds, CompletionList } from '../../../../editor/common/languages.js';
+import { CompletionContext, CompletionItem, CompletionItemInsertTextRule, CompletionItemKind, CompletionItemKinds, CompletionItemLabel, CompletionList } from '../../../../editor/common/languages.js';
 import { ITextModel } from '../../../../editor/common/model.js';
 import { ILanguageFeaturesService } from '../../../../editor/common/services/languageFeatures.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
@@ -70,6 +69,7 @@ import { getSimpleCodeEditorWidgetOptions, getSimpleEditorOptions } from '../../
 import { CONTEXT_DEBUG_STATE, CONTEXT_IN_DEBUG_REPL, CONTEXT_MULTI_SESSION_REPL, DEBUG_SCHEME, IDebugConfiguration, IDebugService, IDebugSession, IReplConfiguration, IReplElement, IReplOptions, REPL_VIEW_ID, State, getStateLabel } from '../common/debug.js';
 import { Variable } from '../common/debugModel.js';
 import { resolveChildSession } from '../common/debugUtils.js';
+import { getReplCompletionRange, getReplHistoryCompletion } from '../common/replCompletions.js';
 import { ReplEvaluationResult, ReplGroup } from '../common/replModel.js';
 import { FocusSessionActionViewItem } from './debugActionViewItems.js';
 import { DEBUG_COMMAND_CATEGORY, FOCUS_REPL_ID } from './debugCommands.js';
@@ -222,7 +222,12 @@ export class Repl extends FilterViewPane implements IHistoryNavigationWidget {
 
 			if (this.styleChangedWhenInvisible) {
 				this.styleChangedWhenInvisible = false;
-				this.tree?.updateChildren(undefined, true, false);
+				// Only update children when the tree has an input - it may not yet
+				// (no debug session has been focused since this view was created),
+				// in which case `_updateChildren` would throw `Tree input not set`.
+				if (this.tree?.getInput()) {
+					this.tree.updateChildren(undefined, true, false);
+				}
 				this.onDidStyleChange();
 			}
 		}));
@@ -274,10 +279,14 @@ export class Repl extends FilterViewPane implements IHistoryNavigationWidget {
 							const response = await session.completions(frameId, focusedStackFrame?.thread.threadId || 0, text, position, token);
 
 							const suggestions: CompletionItem[] = [];
-							const computeRange = (length: number) => Range.fromPositions(position.delta(0, -length), position);
 							if (response && response.body && response.body.targets) {
 								response.body.targets.forEach(item => {
 									if (item && item.label) {
+										const range = getReplCompletionRange(model, position, item);
+										if (!range) {
+											return;
+										}
+
 										let insertTextRules: CompletionItemInsertTextRule | undefined = undefined;
 										let insertText = item.text || item.label;
 										if (typeof item.selectionStart === 'number') {
@@ -288,13 +297,15 @@ export class Repl extends FilterViewPane implements IHistoryNavigationWidget {
 											insertText = insertText.substring(0, item.selectionStart) + placeholder + insertText.substring(item.selectionStart + selectionLength);
 										}
 
+										const label: string | CompletionItemLabel = item.detail
+											? { label: item.label, description: item.detail }
+											: item.label;
 										suggestions.push({
-											label: item.label,
+											label,
 											insertText,
-											detail: item.detail,
 											kind: CompletionItemKinds.fromString(item.type || 'property'),
 											filterText: (item.start && item.length) ? text.substring(item.start, item.start + item.length).concat(item.label) : undefined,
-											range: computeRange(item.length || 0),
+											range,
 											sortText: item.sortText,
 											insertTextRules
 										});
@@ -305,13 +316,22 @@ export class Repl extends FilterViewPane implements IHistoryNavigationWidget {
 							if (this.configurationService.getValue<IDebugConfiguration>('debug').console.historySuggestions) {
 								const history = this.history.getHistory();
 								const idxLength = String(history.length).length;
-								history.forEach((h, i) => suggestions.push({
-									label: h,
-									insertText: h,
-									kind: CompletionItemKind.Text,
-									range: computeRange(h.length),
-									sortText: 'ZZZ' + String(history.length - i).padStart(idxLength, '0')
-								}));
+								history.forEach((h, i) => {
+									const completion = getReplHistoryCompletion(model, position, h);
+									if (!completion) {
+										return;
+									}
+
+									const { insertText, range } = completion;
+									suggestions.push({
+										label: h,
+										insertText,
+										filterText: insertText,
+										kind: CompletionItemKind.Text,
+										range,
+										sortText: 'ZZZ' + String(history.length - i).padStart(idxLength, '0')
+									});
+								});
 							}
 
 							return { suggestions };

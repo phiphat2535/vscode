@@ -7,6 +7,7 @@ import assert from 'assert';
 import { CancellationToken, CancellationTokenSource } from '../../../../../../../base/common/cancellation.js';
 import { match } from '../../../../../../../base/common/glob.js';
 import { Schemas } from '../../../../../../../base/common/network.js';
+import { isWindows } from '../../../../../../../base/common/platform.js';
 import { basename, relativePath } from '../../../../../../../base/common/resources.js';
 import { URI } from '../../../../../../../base/common/uri.js';
 import { mock } from '../../../../../../../base/test/common/mock.js';
@@ -23,7 +24,7 @@ import { IFileMatch, IFileQuery, ISearchService } from '../../../../../../servic
 import { IUserDataProfileService } from '../../../../../../services/userDataProfile/common/userDataProfile.js';
 import { IPathService } from '../../../../../../services/path/common/pathService.js';
 import { PromptsConfig } from '../../../../common/promptSyntax/config/config.js';
-import { PromptsType } from '../../../../common/promptSyntax/promptTypes.js';
+import { getSourceDescription, PromptFileSource, PromptsType } from '../../../../common/promptSyntax/promptTypes.js';
 import { hasGlobPattern, isValidGlob, isValidPromptFolderPath, PromptFilesLocator } from '../../../../common/promptSyntax/utils/promptFilesLocator.js';
 import { mockFiles } from '../testUtils/mockFilesystem.js';
 import { mockService } from './mock.js';
@@ -696,6 +697,75 @@ suite('PromptFilesLocator', () => {
 							'Must find correct prompts.',
 						);
 					}
+				});
+
+				testT('glob-like characters in the workspace folder path', async () => {
+					setLocations({
+						'.github/prompts': true,
+						'deps/**/*.prompt.md': true,
+					});
+					setWorkspaceFolders(['/Users/legomushroom/repos/Game [URP] {v2}']);
+					await mockFiles(fileService, [
+						{
+							path: '/Users/legomushroom/repos/Game [URP] {v2}/.github/prompts/default.prompt.md',
+							contents: ['oh hi, bot!'],
+						},
+						{
+							path: '/Users/legomushroom/repos/Game [URP] {v2}/deps/text/my.prompt.md',
+							contents: ['oh hi, bot!'],
+						},
+					]);
+					const searchedFolders: string[] = [];
+					const searchService = instantiationService.get(ISearchService);
+					const fileSearch = searchService.fileSearch.bind(searchService);
+					instantiationService.stub(ISearchService, 'fileSearch', (query: IFileQuery) => {
+						searchedFolders.push(...query.folderQueries.map(folderQuery => folderQuery.folder.path));
+						return fileSearch(query);
+					});
+					const locator = instantiationService.createInstance(PromptFilesLocator);
+
+					assert.deepStrictEqual(
+						{
+							files: (await locator.listFiles(PromptsType.prompt, PromptsStorage.local, CancellationToken.None)).map(file => file.path),
+							searchedFolders,
+						},
+						{
+							files: [
+								'/Users/legomushroom/repos/Game [URP] {v2}/.github/prompts/default.prompt.md',
+								'/Users/legomushroom/repos/Game [URP] {v2}/deps/text/my.prompt.md',
+							],
+							searchedFolders: ['/Users/legomushroom/repos/Game [URP] {v2}/deps'],
+						},
+					);
+				});
+
+				testT('normalizes the configured path before detecting glob patterns', async () => {
+					setLocations({
+						'unused*/../shared/prompts': true,
+						// backslashes are path separators only on Windows
+						...(isWindows ? { 'deps\\*.prompt.md': true } : {}),
+					});
+					setWorkspaceFolders(['/Users/legomushroom/repos/vscode']);
+					await mockFiles(fileService, [
+						{
+							path: '/Users/legomushroom/repos/vscode/shared/prompts/default.prompt.md',
+							contents: ['oh hi, bot!'],
+						},
+						{
+							path: '/Users/legomushroom/repos/vscode/deps/my.prompt.md',
+							contents: ['oh hi, bot!'],
+						},
+					]);
+					const locator = instantiationService.createInstance(PromptFilesLocator);
+
+					assertOutcome(
+						await locator.listFiles(PromptsType.prompt, PromptsStorage.local, CancellationToken.None),
+						[
+							'/Users/legomushroom/repos/vscode/shared/prompts/default.prompt.md',
+							...(isWindows ? ['/Users/legomushroom/repos/vscode/deps/my.prompt.md'] : []),
+						],
+						'Must find correct prompts.',
+					);
 				});
 			});
 
@@ -1911,6 +1981,35 @@ suite('PromptFilesLocator', () => {
 				'Must find instructions files recursively in subdirectories of .github/instructions.',
 			);
 		});
+
+		testT('finds instructions files in subdirectories when the workspace folder path contains glob-like characters', async () => {
+			setLocations({
+				'.github/instructions': true,
+				'.claude/rules': false,
+				'~/.copilot/instructions': false,
+			});
+			setWorkspaceFolders(['/Users/legomushroom/repos/Game * [URP]']);
+			await mockFiles(fileService, [
+				{
+					path: '/Users/legomushroom/repos/Game * [URP]/.github/instructions/root.instructions.md',
+					contents: ['root instructions'],
+				},
+				{
+					path: '/Users/legomushroom/repos/Game * [URP]/.github/instructions/frontend/react.instructions.md',
+					contents: ['react instructions'],
+				},
+			]);
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			assertOutcome(
+				await locator.listFiles(PromptsType.instructions, PromptsStorage.local, CancellationToken.None),
+				[
+					'/Users/legomushroom/repos/Game * [URP]/.github/instructions/root.instructions.md',
+					'/Users/legomushroom/repos/Game * [URP]/.github/instructions/frontend/react.instructions.md',
+				],
+				'Must find instructions files recursively in subdirectories.',
+			);
+		});
 	});
 
 	suite('skills', () => {
@@ -2283,11 +2382,11 @@ suite('PromptFilesLocator', () => {
 					folders,
 					[
 						// defaults
-						'/Users/legomushroom/repos/vscode/.github/skills',
 						'/Users/legomushroom/repos/vscode/.agents/skills',
+						'/Users/legomushroom/repos/vscode/.github/skills',
 						'/Users/legomushroom/repos/vscode/.claude/skills',
-						'/Users/legomushroom/.copilot/skills',
 						'/Users/legomushroom/.agents/skills',
+						'/Users/legomushroom/.copilot/skills',
 						'/Users/legomushroom/.claude/skills',
 						// custom
 						'/Users/legomushroom/repos/vscode/custom-skills',
@@ -2631,6 +2730,26 @@ suite('PromptFilesLocator', () => {
 				'Must find correct prompts.',
 			);
 		});
+
+		testT('keeps workspace folders with glob-like characters in their path', async () => {
+			setLocations({
+				'.github/prompts': true,
+				'gen/text/**': true,
+				'general/*': true,
+			});
+			setWorkspaceFolders(['/Users/legomushroom/repos/Game [URP] {v2}']);
+			await mockFiles(fileService, []);
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			assertOutcome(
+				await locator.getConfigBasedSourceFolders(PromptsType.prompt),
+				[
+					'/Users/legomushroom/repos/Game [URP] {v2}/.github/prompts',
+					'/Users/legomushroom/repos/Game [URP] {v2}/general',
+				],
+				'Must find correct prompts.',
+			);
+		});
 	});
 
 	suite('findAgentMDsInWorkspace', () => {
@@ -2765,6 +2884,40 @@ suite('PromptFilesLocator', () => {
 			);
 		});
 
+		testT('stops at a submodule .git file', async () => {
+			setWorkspaceFoldersForRoots(['/repos/superproject/submodule']);
+			await mockFiles(fileService, [
+				{ path: '/repos/superproject/.git/HEAD', contents: ['ref: refs/heads/main'] },
+				{ path: '/repos/superproject/submodule/.git', contents: ['gitdir: ../.git/modules/submodule'] },
+				{ path: '/repos/superproject/submodule/src/index.ts', contents: ['export {};'] },
+			]);
+
+			workspaceTrustService.setTrustedUris([URI.file('/repos/superproject/submodule')]);
+
+			const roots = await locator.getWorkspaceFolderRoots(true);
+			assert.deepStrictEqual(roots.map(r => r.path), ['/repos/superproject/submodule']);
+		});
+
+		testT('stops at a git worktree .git file', async () => {
+			setWorkspaceFoldersForRoots(['/repos/repo.worktrees/feature/src']);
+			await mockFiles(fileService, [
+				{ path: '/repos/repo.worktrees/feature/.git', contents: ['gitdir: ../../repo/.git/worktrees/feature'] },
+				{ path: '/repos/repo.worktrees/feature/src/index.ts', contents: ['export {};'] },
+			]);
+
+			workspaceTrustService.setTrustedUris([URI.file('/repos/repo.worktrees/feature')]);
+
+			const roots = await locator.getWorkspaceFolderRoots(true);
+			assert.deepStrictEqual(
+				roots.map(r => r.path).sort(),
+				[
+					'/repos/repo.worktrees/feature',
+					'/repos/repo.worktrees/feature/src',
+				].sort(),
+				'Should include the workspace folder and its worktree root',
+			);
+		});
+
 		testT('does not walk up when includeParents is false', async () => {
 			setWorkspaceFoldersForRoots(['/repos/monorepo/packages/my-app']);
 			await mockFiles(fileService, [
@@ -2782,6 +2935,32 @@ suite('PromptFilesLocator', () => {
 			);
 		});
 
+		testT('excludes vscode-agent-host workspace folders', async () => {
+			// Agent host folders surface customizations through AHP, not via
+			// filesystem scanning. Including them here would issue a `resourceList`
+			// JSON-RPC per configured location for every nonexistent `.github` /
+			// `.claude` folder on the remote.
+			const localFolder = URI.file('/repos/local-project');
+			const agentHostFolder = URI.from({ scheme: 'vscode-agent-host', authority: 'remote', path: '/repos/remote-project' });
+			const folders = [localFolder, agentHostFolder].map((uri, index) => new class extends mock<IWorkspaceFolder>() {
+				override uri = uri;
+				override name = basename(uri);
+				override index = index;
+			});
+			instantiationService.stub(IWorkspaceContextService, mockWorkspaceService(folders));
+			locator = instantiationService.createInstance(PromptFilesLocator);
+			await mockFiles(fileService, [
+				{ path: '/repos/local-project/.git/HEAD', contents: ['ref: refs/heads/main'] },
+			]);
+
+			const roots = await locator.getWorkspaceFolderRoots(true);
+			assert.deepStrictEqual(
+				roots.map(r => r.toString()),
+				[localFolder.toString()],
+				'Should exclude vscode-agent-host workspace folders from prompt-file discovery roots',
+			);
+		});
+
 		testT('returns only workspace folder when no .git is found', async () => {
 			setWorkspaceFoldersForRoots(['/Users/legomushroom/my-project']);
 			await mockFiles(fileService, [
@@ -2794,6 +2973,143 @@ suite('PromptFilesLocator', () => {
 				['/Users/legomushroom/my-project'],
 				'Should only return the workspace folder when no .git is found in any parent',
 			);
+		});
+	});
+	suite('getHookSourceFolders', () => {
+		testT('returns source metadata for hook folders', async () => {
+			configValues[PromptsConfig.HOOKS_LOCATION_KEY] = {
+				'.github/hooks': true,
+				'~/.copilot/hooks': true,
+				// disable Claude paths (which are filtered out anyway)
+				'.claude/settings.json': false,
+				'.claude/settings.local.json': false,
+				'~/.claude/settings.json': false,
+			};
+			setWorkspaceFolders(['/Users/legomushroom/repos/vscode']);
+			await mockFiles(fileService, []);
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			const folders = await locator.getHookSourceFolders();
+
+			assert.deepStrictEqual(
+				folders.map(f => ({ path: f.uri.path, source: f.source, storage: f.storage })),
+				[
+					{ path: '/Users/legomushroom/repos/vscode/.github/hooks', source: PromptFileSource.GitHubWorkspace, storage: PromptsStorage.local },
+					{ path: '/Users/legomushroom/.copilot/hooks', source: PromptFileSource.CopilotPersonal, storage: PromptsStorage.user },
+				],
+			);
+		});
+
+		testT('excludes Claude paths', async () => {
+			configValues[PromptsConfig.HOOKS_LOCATION_KEY] = {
+				'.github/hooks': true,
+				'.claude/settings.json': true,
+				'.claude/settings.local.json': true,
+				'~/.claude/settings.json': true,
+				'~/.copilot/hooks': true,
+			};
+			setWorkspaceFolders(['/Users/legomushroom/repos/vscode']);
+			await mockFiles(fileService, []);
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			const folders = await locator.getHookSourceFolders();
+
+			// Claude paths should be filtered out
+			const paths = folders.map(f => f.uri.path);
+			assert.ok(!paths.some(p => p.includes('.claude')), 'Claude paths must be excluded');
+			assert.deepStrictEqual(paths, [
+				'/Users/legomushroom/repos/vscode/.github/hooks',
+				'/Users/legomushroom/.copilot/hooks',
+			]);
+		});
+	});
+
+	suite('listFiles with PromptsType.hook', () => {
+		testT('only returns targeted json files, not sibling json files', async () => {
+			configValues[PromptsConfig.HOOKS_LOCATION_KEY] = {
+				'.claude/settings.json': true,
+				'.claude/settings.local.json': true,
+				'~/.claude/settings.json': true,
+				'.github/hooks': true,
+				'~/.copilot/hooks': true,
+			};
+			setWorkspaceFolders(['/Users/legomushroom/repos/vscode']);
+			await mockFiles(fileService, [
+				// targeted files that should be found
+				{ path: '/Users/legomushroom/repos/vscode/.claude/settings.json', contents: ['{}'] },
+				{ path: '/Users/legomushroom/repos/vscode/.claude/settings.local.json', contents: ['{}'] },
+				// sibling files in .claude/ that should NOT be found
+				{ path: '/Users/legomushroom/repos/vscode/.claude/config.json', contents: ['{}'] },
+				{ path: '/Users/legomushroom/repos/vscode/.claude/stats-cache.json', contents: ['{}'] },
+				// hook directory files that should be found
+				{ path: '/Users/legomushroom/repos/vscode/.github/hooks/pre-commit.json', contents: ['{}'] },
+			]);
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			const files = await locator.listFiles(PromptsType.hook, PromptsStorage.local, CancellationToken.None);
+			assert.deepStrictEqual(
+				files.map(f => f.path).sort(),
+				[
+					'/Users/legomushroom/repos/vscode/.claude/settings.json',
+					'/Users/legomushroom/repos/vscode/.claude/settings.local.json',
+					'/Users/legomushroom/repos/vscode/.github/hooks/pre-commit.json',
+				],
+			);
+		});
+
+		testT('returns hook files from user home specific json paths', async () => {
+			configValues[PromptsConfig.HOOKS_LOCATION_KEY] = {
+				'~/.claude/settings.json': true,
+				'~/.copilot/hooks': true,
+			};
+			setWorkspaceFolders(['/Users/legomushroom/repos/vscode']);
+			await mockFiles(fileService, [
+				// targeted user file
+				{ path: '/Users/legomushroom/.claude/settings.json', contents: ['{}'] },
+				// sibling files that should NOT be found
+				{ path: '/Users/legomushroom/.claude/config.json', contents: ['{}'] },
+				{ path: '/Users/legomushroom/.claude/stats-cache.json', contents: ['{}'] },
+				// hook directory files
+				{ path: '/Users/legomushroom/.copilot/hooks/my-hook.json', contents: ['{}'] },
+			]);
+			const locator = instantiationService.createInstance(PromptFilesLocator);
+
+			const files = await locator.listFiles(PromptsType.hook, PromptsStorage.user, CancellationToken.None);
+			assert.deepStrictEqual(
+				files.map(f => f.path).sort(),
+				[
+					'/Users/legomushroom/.claude/settings.json',
+					'/Users/legomushroom/.copilot/hooks/my-hook.json',
+				],
+			);
+		});
+	});
+
+	suite('getSourceDescription', () => {
+		test('returns descriptions for all known folder sources', () => {
+			const folderSources: PromptFileSource[] = [
+				PromptFileSource.AgentsWorkspace,
+				PromptFileSource.AgentsPersonal,
+				PromptFileSource.GitHubWorkspace,
+				PromptFileSource.CopilotPersonal,
+				PromptFileSource.ClaudeWorkspace,
+				PromptFileSource.ClaudeWorkspaceLocal,
+				PromptFileSource.ClaudePersonal,
+				PromptFileSource.UserData,
+				PromptFileSource.ConfigWorkspace,
+				PromptFileSource.ConfigPersonal,
+			];
+
+			for (const source of folderSources) {
+				const description = getSourceDescription(source);
+				assert.ok(typeof description === 'string' && description.length > 0, `Expected a description for ${source}`);
+			}
+		});
+
+		test('returns undefined for extension/plugin sources', () => {
+			assert.strictEqual(getSourceDescription(PromptFileSource.ExtensionContribution), undefined);
+			assert.strictEqual(getSourceDescription(PromptFileSource.ExtensionAPI), undefined);
+			assert.strictEqual(getSourceDescription(PromptFileSource.Plugin), undefined);
 		});
 	});
 });

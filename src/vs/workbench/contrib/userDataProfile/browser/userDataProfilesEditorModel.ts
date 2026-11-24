@@ -346,8 +346,7 @@ export abstract class AbstractUserDataProfileElement extends Disposable {
 	}
 
 	getCurrentWorkspace(): URI | undefined {
-		const workspace = this.workspaceContextService.getWorkspace();
-		return workspace.configuration ?? workspace.folders[0]?.uri;
+		return this.workspaceContextService.getWorkspace().uri;
 	}
 
 	openWorkspace(workspace: URI): void {
@@ -928,7 +927,7 @@ export class UserDataProfilesEditorModel extends EditorModel {
 	) {
 		super();
 		for (const profile of userDataProfilesService.profiles) {
-			if (!profile.isTransient) {
+			if (!profile.isInternal) {
 				this._profiles.push(this.createProfileElement(profile));
 			}
 		}
@@ -939,7 +938,7 @@ export class UserDataProfilesEditorModel extends EditorModel {
 	private onDidChangeProfiles(e: DidChangeProfilesEvent): void {
 		let changed = false;
 		for (const profile of e.added) {
-			if (!profile.isTransient && profile.name !== this.newProfileElement?.name) {
+			if (!profile.isInternal && profile.name !== this.newProfileElement?.name) {
 				changed = true;
 				this._profiles.push(this.createProfileElement(profile));
 			}
@@ -1108,7 +1107,7 @@ export class UserDataProfilesEditorModel extends EditorModel {
 			));
 			const updateCreateActionLabel = () => {
 				if (createAction.enabled) {
-					if (this.newProfileElement?.copyFrom && this.userDataProfilesService.profiles.some(p => !p.isTransient && p.name === this.newProfileElement?.name)) {
+					if (this.newProfileElement?.copyFrom && this.userDataProfilesService.profiles.some(p => !p.isInternal && p.name === this.newProfileElement?.name)) {
 						createAction.label = localize('replace', "Replace");
 					} else {
 						createAction.label = localize('create', "Create");
@@ -1274,7 +1273,7 @@ export class UserDataProfilesEditorModel extends EditorModel {
 			return;
 		}
 
-		if (profile && !profile.isTransient && this.newProfileElement) {
+		if (profile && !profile.isInternal && this.newProfileElement) {
 			this.removeNewProfile();
 			const existing = this._profiles.find(([p]) => p.name === profile.name);
 			if (existing) {

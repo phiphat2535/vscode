@@ -5,16 +5,22 @@
 
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../../base/common/event.js';
-import { IDisposable } from '../../../../../base/common/lifecycle.js';
+import { IDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { ResourceMap } from '../../../../../base/common/map.js';
+import { constObservable, IObservable } from '../../../../../base/common/observable.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { URI } from '../../../../../base/common/uri.js';
-import { ReadonlyChatSessionOptionsMap, IChatNewSessionRequest, IChatSession, IChatSessionCommitEvent, IChatSessionContentProvider, IChatSessionCustomizationItemGroup, IChatSessionCustomizationsProvider, IChatSessionItem, IChatSessionItemController, IChatSessionItemsDelta, IChatSessionOptionsChangeEvent, IChatSessionProviderOptionGroup, IChatSessionRequestHistoryItem, IChatSessionsExtensionPoint, IChatSessionsService, ResolvedChatSessionsExtensionPoint, ChatSessionOptionsMap } from '../../common/chatSessionsService.js';
+import { ReadonlyChatSessionOptionsMap, IChatNewSessionRequest, IChatSession, IChatSessionCommitEvent, IChatSessionContentProvider, IChatSessionCustomizationItemGroup, IChatSessionCustomizationsProvider, IChatSessionForkOptions, IChatSessionHistoryItem, IChatSessionItem, IChatSessionItemArchiveProvider, IChatSessionItemArchiveState, IChatSessionItemController, IChatSessionItemsDelta, IChatSessionOptionsChangeEvent, IChatSessionProviderOptionGroup, IChatSessionRequestHistoryItem, IChatSessionsExtensionPoint, IChatSessionsService, ResolvedChatSessionsExtensionPoint, ChatSessionOptionsMap, ChatSessionRefreshReason, IChatInputCompletionsParams, IChatInputCompletionsResult } from '../../common/chatSessionsService.js';
+import { IChatSideChatOrigin, IChatSideChatSelection } from '../../common/chatSideChatService.js';
+import { getChatSessionType } from '../../common/model/chatUri.js';
 import { IChatAgentAttachmentCapabilities } from '../../common/participants/chatAgents.js';
 import { Target } from '../../common/promptSyntax/promptTypes.js';
 
 export class MockChatSessionsService implements IChatSessionsService {
 	_serviceBrand: undefined;
+	readonly archivedSessionItems = constObservable<IChatSessionItemArchiveState>({ available: false, state: 'loaded' });
+	registerChatSessionItemArchiveProvider(_provider: IChatSessionItemArchiveProvider): IDisposable { return toDisposable(() => { }); }
+	acquireArchivedSessionItems(): IDisposable { return toDisposable(() => { }); }
 
 	private readonly _onDidChangeSessionOptions = new Emitter<IChatSessionOptionsChangeEvent>();
 	readonly onDidChangeSessionOptions = this._onDidChangeSessionOptions.event;
@@ -66,7 +72,7 @@ export class MockChatSessionsService implements IChatSessionsService {
 	}
 
 	registerChatSessionItemController(chatSessionType: string, controller: IChatSessionItemController): IDisposable {
-		this.sessionItemControllers.set(chatSessionType, { controller, initialRefresh: controller.refresh(CancellationToken.None) });
+		this.sessionItemControllers.set(chatSessionType, { controller, initialRefresh: controller.refresh(CancellationToken.None, 'initial') });
 		return {
 			dispose: () => {
 				this.sessionItemControllers.delete(chatSessionType);
@@ -118,17 +124,53 @@ export class MockChatSessionsService implements IChatSessionsService {
 		}
 	}
 
-	async refreshChatSessionItems(providerTypeFilter: readonly string[] | undefined, token: CancellationToken): Promise<void> {
+	async refreshChatSessionItems(providerTypeFilter: readonly string[] | undefined, token: CancellationToken, _onError?: (error: unknown) => void, reason: ChatSessionRefreshReason = 'manual'): Promise<void> {
 		await Promise.all(
 			Array.from(this.sessionItemControllers.entries())
 				.filter(([chatSessionType]) => !providerTypeFilter || providerTypeFilter.includes(chatSessionType))
 				.map(async ([_chatSessionType, controllerEntry]) => {
-					await controllerEntry.controller.refresh(token);
+					await controllerEntry.controller.refresh(token, reason);
 				}));
 	}
 
 	getInProgress(): { chatSessionType: string; count: number }[] {
 		return Array.from(this.inProgress.entries()).map(([chatSessionType, count]) => ({ chatSessionType, count }));
+	}
+
+	async resolveChatSessionItem(_chatSessionType: string, _resource: URI, _token: CancellationToken): Promise<IChatSessionItem | undefined> {
+		return undefined;
+	}
+
+	canSetChatSessionItemArchived(sessionResource: URI): boolean {
+		const sessionType = getChatSessionType(sessionResource);
+		return typeof this.sessionItemControllers.get(sessionType)?.controller.setChatSessionItemArchived === 'function';
+	}
+
+	getPreviousChatSessionResource(resource: URI): URI | undefined {
+		return this.sessionItemControllers.get(resource.scheme)?.controller.getPreviousSessionResource?.(resource);
+	}
+
+	setChatSessionItemArchived(sessionResource: URI, archived: boolean): void {
+		const sessionType = getChatSessionType(sessionResource);
+		const controller = this.sessionItemControllers.get(sessionType)?.controller;
+		if (!controller?.setChatSessionItemArchived) {
+			throw new Error(`Session ${sessionResource.toString()} does not support archiving`);
+		}
+		controller.setChatSessionItemArchived(sessionResource, archived);
+	}
+
+	canSetChatSessionItemRead(sessionResource: URI): boolean {
+		const sessionType = getChatSessionType(sessionResource);
+		return typeof this.sessionItemControllers.get(sessionType)?.controller.setChatSessionItemRead === 'function';
+	}
+
+	setChatSessionItemRead(sessionResource: URI, isRead: boolean): void {
+		const sessionType = getChatSessionType(sessionResource);
+		const controller = this.sessionItemControllers.get(sessionType)?.controller;
+		if (!controller?.setChatSessionItemRead) {
+			throw new Error(`Session ${sessionResource.toString()} does not own read state`);
+		}
+		controller.setChatSessionItemRead(sessionResource, isRead);
 	}
 
 	registerChatSessionContentProvider(chatSessionType: string, provider: IChatSessionContentProvider): IDisposable {
@@ -146,15 +188,60 @@ export class MockChatSessionsService implements IChatSessionsService {
 	}
 
 	async getOrCreateChatSession(sessionResource: URI, token: CancellationToken): Promise<IChatSession> {
-		const provider = this.contentProviders.get(sessionResource.scheme);
+		const sessionType = getChatSessionType(sessionResource);
+		const provider = this.contentProviders.get(sessionType);
 		if (!provider) {
-			throw new Error(`No content provider for ${sessionResource.scheme}`);
+			throw new Error(`No content provider for ${sessionType}`);
 		}
 		return provider.provideChatSessionContent(sessionResource, token);
 	}
 
+	updateChatSessionMetadata(sessionResource: URI, metadata: Record<string, unknown>): boolean {
+		const sessionType = getChatSessionType(sessionResource);
+		const provider = this.contentProviders.get(sessionType);
+		if (!provider?.updateChatSessionMetadata) {
+			return false;
+		}
+		provider.updateChatSessionMetadata(sessionResource, metadata);
+		return true;
+	}
+
+	async getChatSessionHistory(sessionResource: URI, token: CancellationToken): Promise<readonly IChatSessionHistoryItem[]> {
+		const session = await this.getOrCreateChatSession(sessionResource, token);
+		try {
+			return [...session.history];
+		} finally {
+			session.dispose();
+		}
+	}
+
 	async canResolveChatSession(sessionType: string): Promise<boolean> {
 		return this.contentProviders.has(sessionType);
+	}
+
+	async provideChatInputCompletions(sessionResource: URI, params: IChatInputCompletionsParams, token: CancellationToken): Promise<IChatInputCompletionsResult | undefined> {
+		const sessionType = getChatSessionType(sessionResource);
+		const provider = this.contentProviders.get(sessionType);
+		if (!provider?.provideChatInputCompletions) {
+			return undefined;
+		}
+		return provider.provideChatInputCompletions(sessionResource, params, token);
+	}
+
+	resolveChatResponseUri(sessionResource: URI, href: string, kind: 'link' | 'image'): string {
+		const sessionType = getChatSessionType(sessionResource);
+		return this.contentProviders.get(sessionType)?.resolveChatResponseUri?.(sessionResource, href, kind) ?? href;
+	}
+
+	async getChatInputCompletionTriggerCharacters(sessionType: string): Promise<readonly string[] | undefined> {
+		const provider = this.contentProviders.get(sessionType);
+		if (!provider) {
+			return undefined;
+		}
+		if (!provider.provideChatInputCompletionTriggerCharacters) {
+			return [];
+		}
+		return provider.provideChatInputCompletionTriggerCharacters();
 	}
 
 	getOptionGroupsForSessionType(chatSessionType: string): IChatSessionProviderOptionGroup[] | undefined {
@@ -169,7 +256,7 @@ export class MockChatSessionsService implements IChatSessionsService {
 		}
 	}
 
-	async getNewChatSessionInputState(_chatSessionType: string): Promise<readonly IChatSessionProviderOptionGroup[] | undefined> {
+	async getNewChatSessionInputState(_chatSessionType: string, _sessionResource: URI): Promise<readonly IChatSessionProviderOptionGroup[] | undefined> {
 		return undefined;
 	}
 
@@ -212,6 +299,15 @@ export class MockChatSessionsService implements IChatSessionsService {
 		return this.contributions.find(c => c.type === chatSessionType)?.requiresCustomModels ?? false;
 	}
 
+	supportsAutoModelForSessionType(chatSessionType: string): boolean {
+		return !!this.contributions.find(c => c.type === chatSessionType)?.supportsAutoModel;
+	}
+
+	requiresCopilotSignInForSessionType(chatSessionType: string): boolean {
+		const requires = this.contributions.find(c => c.type === chatSessionType)?.requiresCopilotSignIn;
+		return typeof requires === 'function' ? requires() : !!requires;
+	}
+
 	supportsDelegationForSessionType(chatSessionType: string): boolean {
 		return this.contributions.find(c => c.type === chatSessionType)?.supportsDelegation !== false;
 	}
@@ -220,7 +316,27 @@ export class MockChatSessionsService implements IChatSessionsService {
 		return false;
 	}
 
-	async forkChatSession(_sessionResource: URI, _request: IChatSessionRequestHistoryItem | undefined, _token: CancellationToken): Promise<IChatSessionItem> {
+	sessionSupportsSideChat(_sessionResource: URI): boolean {
+		return false;
+	}
+
+	observeSideChatOrigin(_sessionResource: URI): IObservable<IChatSideChatOrigin | undefined> {
+		return constObservable(undefined);
+	}
+
+	async createSideChat(_sessionResource: URI, _turnId: string, _token: CancellationToken, _selection?: IChatSideChatSelection): Promise<IChatSessionItem> {
+		throw new Error('Not implemented');
+	}
+
+	async forkChatSession(_sessionResource: URI, _request: IChatSessionRequestHistoryItem | undefined, _token: CancellationToken, _options?: IChatSessionForkOptions): Promise<IChatSessionItem> {
+		throw new Error('Not implemented');
+	}
+
+	sessionSupportsRename(_sessionResource: URI): boolean {
+		return false;
+	}
+
+	async renameChatSession(_sessionResource: URI, _title: string, _token: CancellationToken): Promise<void> {
 		throw new Error('Not implemented');
 	}
 
@@ -232,8 +348,37 @@ export class MockChatSessionsService implements IChatSessionsService {
 		return undefined;
 	}
 
-	registerSessionResourceAlias(_untitledResource: URI, _realResource: URI): void {
-		// noop
+	async deleteChatSessionItem(sessionResource: URI, token: CancellationToken): Promise<void> {
+		const chatSessionType = getChatSessionType(sessionResource);
+		const controllerData = this.sessionItemControllers.get(chatSessionType);
+		if (!controllerData?.controller.deleteChatSessionItem) {
+			throw new Error(`Session ${sessionResource.toString()} does not support deletion`);
+		}
+		await controllerData.initialRefresh;
+		return controllerData.controller.deleteChatSessionItem(sessionResource, token);
+	}
+
+	private readonly _resourceAliases = new ResourceMap<URI>(); // real -> untitled
+	private readonly _realResources = new ResourceMap<URI>(); // untitled -> real
+
+	registerSessionResourceAlias(untitledResource: URI, realResource: URI): void {
+		this._resourceAliases.set(realResource, untitledResource);
+	}
+
+	setMaterializedSessionResource(untitledResource: URI, realResource: URI): void {
+		this._realResources.set(untitledResource, realResource);
+	}
+
+	getMaterializedSessionResource(untitledResource: URI): URI | undefined {
+		return this._realResources.get(untitledResource);
+	}
+
+	clearMaterializedSessionResource(sessionResource: URI): void {
+		this._realResources.delete(sessionResource);
+		const untitled = this._resourceAliases.get(sessionResource);
+		if (untitled) {
+			this._realResources.delete(untitled);
+		}
 	}
 
 	fireSessionCommitted(_original: URI, _committed: URI): void {

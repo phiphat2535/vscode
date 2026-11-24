@@ -6,16 +6,137 @@
 import { MarkdownString } from '../../../../../base/common/htmlContent.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
+import { IBrowserViewNetwork } from '../../../../../platform/browserView/common/browserView.js';
 import { BrowserViewUri } from '../../../../../platform/browserView/common/browserViewUri.js';
 import { IInvokeFunctionResult, IPlaywrightService } from '../../../../../platform/browserView/common/playwrightService.js';
+import { IAgentNetworkFilterService } from '../../../../../platform/networkFilter/common/networkFilterService.js';
+import { isLocalhostAuthority } from '../../../../../platform/url/common/trustedDomains.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
-import { IToolResult } from '../../../chat/common/tools/languageModelToolsService.js';
+import { IToolInvocation, IToolResult } from '../../../chat/common/tools/languageModelToolsService.js';
 import { BrowserEditorInput } from '../../common/browserEditorInput.js';
+import { browserViewUrlMatches, BrowserViewSharingState, IBrowserViewWorkbenchService } from '../../common/browserView.js';
+import { IRemoteExplorerService } from '../../../../services/remote/common/remoteExplorerService.js';
+import { mapHasAddressLocalhostOrAllInterfaces } from '../../../../services/remote/common/tunnelModel.js';
+import { extractLocalHostUriMetaDataForPortMapping } from '../../../../../platform/tunnel/common/tunnel.js';
 
 // eslint-disable-next-line local/code-import-patterns
 import type { Page } from 'playwright-core';
 
 export const DEFAULT_ELEMENT_LABEL = localize('browser.element', 'element');
+
+/**
+ * Extracts the session ID from a tool invocation context.
+ * Falls back to a default string when no session context is available.
+ */
+export function getSessionId(invocation: IToolInvocation): string {
+	return getSessionIdForResource(invocation.context?.sessionResource);
+}
+
+/** The session ID of a chat session resource, or a default string without one. */
+export function getSessionIdForResource(sessionResource: URI | undefined): string {
+	return sessionResource?.toString() ?? '<default>';
+}
+
+export interface FormatBrowserEditorLinesOptions {
+	indent?: string;
+	numbered?: boolean;
+	excludeIds?: boolean;
+	agentNetworkFilterService?: IAgentNetworkFilterService;
+}
+
+/**
+ * Formats a list of browser editors as summary lines such as
+ * `- [pageId] Title (url) (active)`. Active/visible hints are
+ * derived from the editor service automatically.
+ *
+ * When {@link FormatBrowserEditorLinesOptions.agentNetworkFilterService} is
+ * provided, pages whose URL is blocked by network policy are masked to avoid
+ * leaking title or URL to the model.
+ */
+export function formatBrowserEditorList(editorService: IEditorService, editors: readonly BrowserEditorInput[], options?: FormatBrowserEditorLinesOptions): string {
+	const activeEditor = editorService.activeEditor;
+	const visibleEditors = new Set(editorService.visibleEditors);
+	const indent = options?.indent ?? '';
+	const filterService = options?.agentNetworkFilterService;
+	return editors.map((editor, index) => {
+		const url = editor.url || 'about:blank';
+
+		// If the page URL is blocked by network policy, mask its details.
+		let blocked = false;
+		if (filterService && url !== 'about:blank') {
+			try { blocked = !filterService.isUriAllowed(URI.parse(url)); } catch { }
+		}
+
+		const title = blocked ? localize('browser.blockedByPolicy', "Blocked by network domain policy") : (editor.title || 'Untitled');
+		const displayUrl = blocked ? '' : ` (${url})`;
+		const resourceNavigationHint = editor.associatedResource ? ' (resource-backed; navigation is limited to this resource)' : '';
+		const hint = editor === activeEditor ? ' (active)' : visibleEditors.has(editor) ? ' (visible)' : ' (not visible)';
+		const id = options?.excludeIds ? '' : `[${editor.id}] `;
+
+		// By default, use numbers only if we're excluding IDs, so models don't get confused about which ID to use.
+		const bullet = (options?.numbered ?? options?.excludeIds) ? `${index + 1}. ` : '- ';
+		return `${indent}${bullet}${id}${title}${displayUrl}${resourceNavigationHint}${hint}`;
+	}).join('\n');
+}
+
+export function getBrowserPageResourceNavigationError(editor: BrowserEditorInput | undefined, target: string): string | undefined {
+	if (!editor?.associatedResource || editor.isAssociatedResourceNavigation(target)) {
+		return undefined;
+	}
+
+	return 'This browser page is associated with a resource and cannot be navigated to a different resource. Only query and fragment changes are allowed. Use a different page or open a new one with the open_browser_page tool.';
+}
+
+export function getBrowserPagesContext(
+	editorService: IEditorService,
+	browserViewService: IBrowserViewWorkbenchService,
+	agentNetworkFilterService: IAgentNetworkFilterService,
+	options?: {
+		activeSessionId?: string;
+		sandboxSessionId?: string;
+		canPromptUser?: boolean;
+	},
+): string | undefined {
+	const views = [...browserViewService.getContextualBrowserViews({
+		activeSessionId: options?.activeSessionId,
+		...(options?.sandboxSessionId !== undefined ? { sandboxSessionId: options.sandboxSessionId } : {}),
+	}).values()];
+	const sharedViews = views.filter(view => view.model?.sharingState === BrowserViewSharingState.Shared);
+	const unsharedCount = views.filter(view => !view.model || view.model.sharingState === BrowserViewSharingState.Available).length;
+	const blockedCount = views.filter(view => view.model?.sharingState === BrowserViewSharingState.BlockedByNetworkPolicy).length;
+
+	const isNetworkFilterEnabled = agentNetworkFilterService.isEnabled();
+	if (sharedViews.length === 0 && unsharedCount === 0 && blockedCount === 0 && !isNetworkFilterEnabled) {
+		return undefined;
+	}
+
+	let value: string;
+	if (sharedViews.length > 0) {
+		value = 'The following browser pages are currently shared with you and can be interacted with using the browser tools:';
+		value += '\n' + formatBrowserEditorList(editorService, sharedViews, { agentNetworkFilterService });
+	} else {
+		value = 'No browser pages are currently shared with you.';
+	}
+
+	if (unsharedCount > 0) {
+		value += '\n\n';
+		value += `${unsharedCount} ${unsharedCount === 1 ? 'page is' : 'pages are'} open but not shared.`;
+		value += options?.canPromptUser
+			? `\nUse the 'open_browser_page' tool to open a new page or to help the user share an existing page.`
+			: `\nUse the 'open_browser_page' tool to open a new page.`;
+	}
+
+	if (blockedCount > 0) {
+		value += '\n\n';
+		value += `${blockedCount} ${blockedCount === 1 ? 'page is' : 'pages are'} open but cannot be shared because network policy blocks the current address.`;
+	}
+
+	if (isNetworkFilterEnabled) {
+		value += '\n\nNetwork domain policy is active. Blocked requests may fail with `net::ERR_BLOCKED_BY_CLIENT`.';
+	}
+
+	return value;
+}
 
 /**
  * Creates a markdown link to a browser page.
@@ -32,11 +153,12 @@ export function createBrowserPageLink(pageId: string | URI): string {
  */
 export async function playwrightInvokeRaw<TArgs extends unknown[], TReturn>(
 	playwrightService: IPlaywrightService,
+	sessionId: string,
 	pageId: string,
 	fn: (page: Page, ...args: TArgs) => Promise<TReturn>,
 	...args: TArgs
 ): Promise<TReturn> {
-	return playwrightService.invokeFunctionRaw(pageId, fn.toString(), ...args);
+	return playwrightService.invokeFunctionRaw(sessionId, pageId, fn.toString(), ...args);
 }
 
 /**
@@ -48,17 +170,26 @@ export async function playwrightInvokeRaw<TArgs extends unknown[], TReturn>(
  */
 export async function playwrightInvoke<TArgs extends unknown[], TReturn>(
 	playwrightService: IPlaywrightService,
+	sessionId: string,
 	pageId: string,
 	fn: (page: Page, ...args: TArgs) => Promise<TReturn>,
 	...args: TArgs
 ): Promise<IToolResult> {
 	try {
-		const result = await playwrightService.invokeFunction(pageId, fn.toString(), args);
+		const result = await playwrightService.invokeFunction(sessionId, pageId, fn.toString(), args);
 		return invokeFunctionResultToToolResult(result);
 	} catch (e) {
 		return errorResult(e instanceof Error ? e.message : String(e));
 	}
 }
+
+/**
+ * Past-tense label for a browser tool call that failed.
+ *
+ * Without one, a completed call keeps whatever label the tool prepared, so a
+ * failure reads as a success.
+ */
+const failedMessage = localize('browser.actionFailed', "Browser action failed");
 
 /**
  * Convert an {@link IInvokeFunctionResult} to an {@link IToolResult},
@@ -78,6 +209,7 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult, 
 	content.push({ kind: 'text', value: result.summary });
 	return {
 		content,
+		...(result.error !== undefined ? { toolResultError: result.error || failedMessage, toolResultMessage: failedMessage } : {}),
 		...(code ? {
 			toolResultDetails: {
 				input: code,
@@ -85,66 +217,167 @@ export function invokeFunctionResultToToolResult(result: IInvokeFunctionResult, 
 				output: result.result || result.error
 					? [{ type: 'embed' as const, isText: true, value: JSON.stringify(result.result ?? result.error, null, 2) }]
 					: [],
-				isError: !!result.error,
+				isError: result.error !== undefined,
 			},
 		} : {}),
 	};
 }
 
 export function errorResult(message: string): IToolResult {
+	const error = message || failedMessage;
 	return {
-		content: [{ kind: 'text', value: message }],
-		toolResultError: message,
+		content: [{ kind: 'text', value: error }],
+		toolResultError: error,
+		toolResultMessage: failedMessage,
+	};
+}
+
+export function getBrowserNetworkPolicyError(url: string, agentNetworkFilterService: IAgentNetworkFilterService): string | undefined {
+	const uri = URI.parse(url);
+	return agentNetworkFilterService.isUriAllowed(uri) ? undefined : agentNetworkFilterService.formatError(uri);
+}
+
+export function getExternalTunnelNetworkPolicyError(
+	rewrite: { url: string; rewritten: boolean },
+	agentNetworkFilterService: IAgentNetworkFilterService,
+): string | undefined {
+	if (!rewrite.rewritten) {
+		return undefined;
+	}
+	const uri = URI.parse(rewrite.url);
+	return isLocalhostAuthority(uri.authority)
+		? undefined
+		: getBrowserNetworkPolicyError(rewrite.url, agentNetworkFilterService);
+}
+
+/**
+ * In a remote workspace where remote proxying is not enabled, the integrated
+ * browser runs on the local machine and cannot reach the remote's localhost
+ * directly. This rewrites a remote localhost URL to the local address of an
+ * already-forwarded port so the browser can reach it.
+ *
+ * Returns the original URL and `rewritten: false` when not applicable (remote
+ * proxying is enabled, the URL is not a localhost URL, or the remote port has
+ * not been forwarded).
+ */
+export function rewriteRemoteLocalhostUrl(
+	url: string,
+	remoteExplorerService: IRemoteExplorerService,
+	usesRemoteNetwork: boolean,
+): { url: string; rewritten: boolean } {
+	// A page on the remote network reaches the remote's localhost directly, so no rewriting is needed.
+	if (usesRemoteNetwork) {
+		return { url, rewritten: false };
+	}
+
+	let uri = URI.parse(url);
+
+	// Hostnames are case-insensitive, but the localhost port-mapping matcher is
+	// case-sensitive. Normalize the authority so e.g. `http://LOCALHOST:3000` matches.
+	if (uri.authority) {
+		uri = uri.with({ authority: uri.authority.toLowerCase() });
+	}
+
+	const portMapping = extractLocalHostUriMetaDataForPortMapping(uri);
+	if (!portMapping) {
+		return { url, rewritten: false }; // Not a localhost http(s) URL
+	}
+
+	const tunnelModel = remoteExplorerService.tunnelModel;
+	const forwarded = mapHasAddressLocalhostOrAllInterfaces(tunnelModel.forwarded, portMapping.address, portMapping.port)
+		?? mapHasAddressLocalhostOrAllInterfaces(tunnelModel.detected, portMapping.address, portMapping.port);
+	if (!forwarded?.localUri) {
+		return { url, rewritten: false }; // The remote port has not been forwarded; leave the URL as-is
+	}
+
+	// The forwarded tunnel's `localUri` carries the configured scheme (e.g. https)
+	// and local authority; keep the original request's path, query and fragment.
+	const rewritten = forwarded.localUri.with({ path: uri.path, query: uri.query, fragment: uri.fragment });
+	return { url: rewritten.toString(), rewritten: true };
+}
+
+/**
+ * Builds a text tool-result item informing the agent that a remote localhost
+ * URL was rewritten to its forwarded local address.
+ */
+export function remoteUrlRewriteNotice(originalUrl: string, rewrittenUrl: string): { kind: 'text'; value: string } {
+	return {
+		kind: 'text',
+		value: `Note: \`${originalUrl}\` was rewritten to \`${rewrittenUrl}\` because this is a remote workspace and the remote port is forwarded to a local address.`,
 	};
 }
 
 /**
- * Checks whether a browser editor with the same host (hostname + port) already
- * exists. When {@link playwrightService} is provided, only pages tracked by Playwright
- * (i.e. shared with the agent) are considered.
- *
- * @returns The first matching {@link BrowserEditorInput}, or `undefined` if none was found.
+ * A notice for pages that use the user's local network although the session
+ * requested a remote one (`requested`), for example because the agent host
+ * cannot proxy browsers. `used` is the network the pages actually use.
  */
-export async function findExistingPageByHost(
-	editorService: IEditorService,
-	playwrightService: IPlaywrightService | undefined,
-	url: string,
-): Promise<BrowserEditorInput | undefined> {
-	const parsed = URL.parse(url);
-	if (!parsed?.host) {
+export function localNetworkFallbackNotice(requested: IBrowserViewNetwork | undefined, used: IBrowserViewNetwork | undefined): { kind: 'text'; value: string } | undefined {
+	if (!requested || used) {
 		return undefined;
 	}
+	return {
+		kind: 'text',
+		value: 'Note: These browser pages load from the user\'s local network, not the remote host\'s network, so `localhost` refers to the user\'s machine. Services running on the remote host are not reachable from them.',
+	};
+}
 
-	const trackedIds = playwrightService
-		? new Set(await playwrightService.getTrackedPages())
-		: undefined;
-
-	for (const editor of editorService.editors) {
+/**
+ * Checks whether a browser editor with the same host (hostname + port) on the
+ * same network already exists. Pages keep the network they were opened on, so
+ * the same URL on another network is a different destination.
+ *
+ * @param network The network a new page would use, or `undefined` for the local network.
+ * @returns All matching {@link BrowserEditorInput}s.
+ */
+export function findExistingPagesByHost(
+	browserViewService: IBrowserViewWorkbenchService,
+	url: string,
+	network: IBrowserViewNetwork | undefined,
+	options?: {
+		includeBlank?: boolean;
+		sharingState?: BrowserViewSharingState;
+		activeSessionId?: string;
+	}
+): BrowserEditorInput[] {
+	const results: BrowserEditorInput[] = [];
+	for (const editor of browserViewService.getContextualBrowserViews({ activeSessionId: options?.activeSessionId }).values()) {
 		if (!(editor instanceof BrowserEditorInput)) {
 			continue;
 		}
-		if (trackedIds && !trackedIds.has(editor.id)) {
+		if (options?.sharingState && editor.model?.sharingState !== options.sharingState) {
 			continue;
 		}
-		const editorUrl = editor.url;
-		if (editorUrl && URL.parse(editorUrl)?.host === parsed.host) {
-			return editor;
+		if (editor.activeNetwork?.authority !== network?.authority) {
+			continue;
+		}
+		if (browserViewUrlMatches(editor.url, url, options?.includeBlank)) {
+			results.push(editor);
 		}
 	}
-	return undefined;
+	return results;
 }
 
 /**
  * Builds the "already open" tool result returned when an existing page with the
- * same host is found by {@link findExistingPageByHost}.
+ * same host is found by {@link findExistingPagesByHost}.
  */
-export function alreadyOpenResult(existing: BrowserEditorInput): IToolResult {
-	const link = createBrowserPageLink(existing.id);
+export async function getExistingPagesResult(
+	editorService: IEditorService,
+	existing: BrowserEditorInput[],
+	formatOptions?: FormatBrowserEditorLinesOptions
+): Promise<IToolResult | undefined> {
+	if (existing.length === 0) {
+		return undefined;
+	}
+
+	const list = formatBrowserEditorList(editorService, existing, { indent: '  ', ...formatOptions });
+	const links = existing.map(e => createBrowserPageLink(e.id));
 	return {
 		content: [{
 			kind: 'text',
-			value: `A page on this host is already open (Page ID: ${existing.id}). Use this page or pass \`forceNew: true\` to open a new one.`,
+			value: `At least one similar page is already open:\n${list}\n\nUse an existing page or pass \`forceNew: true\` to open a new one.`
 		}],
-		toolResultMessage: new MarkdownString(localize('browser.open.alreadyOpen', "Already open: {0}", link)),
+		toolResultMessage: new MarkdownString(localize('browser.open.alreadyOpen', "Already open: {0}", links.join(', '))),
 	};
 }

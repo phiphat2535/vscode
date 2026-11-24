@@ -321,6 +321,32 @@ export abstract class ViewPane extends Pane implements IView {
 	private _onDidChangeBodyVisibility = this._register(new Emitter<boolean>());
 	readonly onDidChangeBodyVisibility: Event<boolean> = this._onDidChangeBodyVisibility.event;
 
+	protected readonly _onDidChangeOptimalHeight = this._register(new Emitter<void>());
+	readonly onDidChangeOptimalHeight = this._onDidChangeOptimalHeight.event;
+	private minimumBodySizeBeforeContentSizing: number | undefined;
+
+	protected get isSizeToContent(): boolean {
+		return this.minimumBodySizeBeforeContentSizing !== undefined;
+	}
+
+	/** Temporarily removes the body minimum so a host can fit intrinsic content. */
+	setSizeToContent(enabled: boolean): void {
+		if (enabled === this.isSizeToContent) {
+			return;
+		}
+		if (enabled) {
+			this.minimumBodySizeBeforeContentSizing = this.minimumBodySize;
+			this.minimumBodySize = 0;
+		} else {
+			const minimum = this.minimumBodySizeBeforeContentSizing;
+			if (minimum !== undefined) {
+				this.minimumBodySizeBeforeContentSizing = undefined;
+				this.minimumBodySize = minimum;
+			}
+		}
+		this._onDidChangeOptimalHeight.fire();
+	}
+
 	protected _onDidChangeTitleArea = this._register(new Emitter<void>());
 	readonly onDidChangeTitleArea: Event<void> = this._onDidChangeTitleArea.event;
 
@@ -346,6 +372,16 @@ export abstract class ViewPane extends Pane implements IView {
 	}
 
 	readonly menuActions: ViewMenuActions;
+
+	/**
+	 * Additional menu groups (beyond `navigation`) whose actions should be
+	 * rendered as primary (inline) actions in the title action bar. Separators
+	 * are rendered between groups in the primary actions. Subclasses can
+	 * override this to customize grouping in the title action bar.
+	 */
+	protected get primaryActionGroups(): string[] | undefined {
+		return undefined;
+	}
 
 	private progressBar?: ProgressBar;
 	private progressIndicator?: IProgressIndicator;
@@ -393,7 +429,7 @@ export abstract class ViewPane extends Pane implements IView {
 		this._register(Event.filter(viewDescriptorService.onDidChangeLocation, e => e.views.some(view => view.id === this.id))(() => viewLocationKey.set(ViewContainerLocationToString(viewDescriptorService.getViewLocationById(this.id)!))));
 
 		const childInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, this.scopedContextKeyService])));
-		this.menuActions = this._register(childInstantiationService.createInstance(ViewMenuActions, options.titleMenuId ?? MenuId.ViewTitle, MenuId.ViewTitleContext, { shouldForwardArgs: !options.donotForwardArgs, renderShortTitle: true }));
+		this.menuActions = this._register(childInstantiationService.createInstance(ViewMenuActions, options.titleMenuId ?? MenuId.ViewTitle, MenuId.ViewTitleContext, { shouldForwardArgs: !options.donotForwardArgs, renderShortTitle: true }, { primaryActionGroups: this.primaryActionGroups }));
 		this._register(this.menuActions.onDidChange(() => this.updateActions()));
 	}
 
@@ -726,6 +762,18 @@ export abstract class ViewPane extends Pane implements IView {
 
 	getOptimalWidth(): number {
 		return 0;
+	}
+
+	/** Returns the intrinsic height, including the header, when the view supports content sizing. */
+	getOptimalHeight(): number | undefined {
+		const expanded = !this.headerVisible || this.isExpanded();
+		const headerHeight = this.minimumSize - (expanded ? this.minimumBodySize : 0);
+		const bodyHeight = this.getOptimalBodyHeight();
+		return expanded ? bodyHeight === undefined ? undefined : headerHeight + bodyHeight : headerHeight;
+	}
+
+	protected getOptimalBodyHeight(): number | undefined {
+		return undefined;
 	}
 
 	saveState(): void {

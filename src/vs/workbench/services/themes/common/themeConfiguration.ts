@@ -11,12 +11,15 @@ import { IConfigurationRegistry, Extensions as ConfigurationExtensions, IConfigu
 import { IJSONSchema } from '../../../../base/common/jsonSchema.js';
 import { textmateColorsSchemaId, textmateColorGroupSchemaId } from './colorThemeSchema.js';
 import { workbenchColorsSchemaId } from '../../../../platform/theme/common/colorRegistry.js';
+import { sizeCustomizationsSchemaId } from '../../../../platform/theme/common/sizeRegistry.js';
+import { SIZE_CUSTOMIZATIONS_SETTING } from '../../../../platform/theme/common/sizeService.js';
 import { tokenStylingSchemaId } from '../../../../platform/theme/common/tokenClassificationRegistry.js';
 import { ThemeSettings, IWorkbenchColorTheme, IWorkbenchFileIconTheme, IColorCustomizations, ITokenColorCustomizations, IWorkbenchProductIconTheme, ISemanticTokenColorCustomizations, ThemeSettingTarget, ThemeSettingDefaults } from './workbenchThemeService.js';
 import { IConfigurationService, ConfigurationTarget } from '../../../../platform/configuration/common/configuration.js';
 import { isWeb } from '../../../../base/common/platform.js';
 import { ColorScheme } from '../../../../platform/theme/common/theme.js';
 import { IHostColorSchemeService } from './hostColorSchemeService.js';
+import { IColorScheme } from '../../../../platform/window/common/window.js';
 
 // Configuration: Themes
 const configurationRegistry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration);
@@ -85,6 +88,7 @@ const detectColorSchemeSettingSchema: IConfigurationPropertySchema = {
 	type: 'boolean',
 	markdownDescription: nls.localize({ key: 'detectColorScheme', comment: ['{0} and {1} will become links to other settings.'] }, 'If enabled, will automatically select a color theme based on the system color mode. If the system color mode is dark, {0} is used, else {1}.', formatSettingAsLink(ThemeSettings.PREFERRED_DARK_THEME), formatSettingAsLink(ThemeSettings.PREFERRED_LIGHT_THEME)),
 	default: false,
+	...(isWeb ? { agentsWindow: { default: true } } : {}),
 	tags: [COLOR_THEME_CONFIGURATION_SETTINGS_TAG],
 };
 
@@ -137,6 +141,12 @@ const themeSettingsConfiguration: IConfigurationNode = {
 		[ThemeSettings.PREFERRED_HC_LIGHT_THEME]: preferredHCLightThemeSettingSchema,
 		[ThemeSettings.FILE_ICON_THEME]: fileIconThemeSettingSchema,
 		[ThemeSettings.COLOR_CUSTOMIZATIONS]: colorCustomizationsSchema,
+		[SIZE_CUSTOMIZATIONS_SETTING]: {
+			type: 'object',
+			default: {},
+			allOf: [{ $ref: sizeCustomizationsSchemaId }],
+			description: nls.localize('sizeCustomizations', "Customizes panel corners and inter-panel spacing in pixels. Use panels.cornerRadius (0-8) for shared panel corners, with individual area overrides. Use panels.spacing (0-16) for panel gaps. Agents window panels also support agentsWindow overrides. Compact layouts remain gapless, and joined edges remain square. Controls, pop-ups, native operating system surfaces, and window-edge gutters are unchanged."),
+		},
 		[ThemeSettings.PRODUCT_ICON_THEME]: productIconThemeSettingSchema
 	}
 };
@@ -342,8 +352,23 @@ export class ThemeConfiguration {
 		return undefined;
 	}
 
+	public isDetectingHighContrast(): boolean {
+		return this.configurationService.getValue(ThemeSettings.DETECT_HC);
+	}
+
 	public isDetectingColorScheme(): boolean {
 		return this.configurationService.getValue(ThemeSettings.DETECT_COLOR_SCHEME);
+	}
+
+	public isPreferredColorSchemeChange(previous: IColorScheme): boolean {
+		const darkChanged = previous.dark !== this.hostColorService.dark;
+		if (this.isDetectingColorScheme() && darkChanged) {
+			return true;
+		}
+		if (this.isDetectingHighContrast()) {
+			return previous.highContrast !== this.hostColorService.highContrast || (this.hostColorService.highContrast && darkChanged);
+		}
+		return false;
 	}
 
 	public getColorThemeSettingId(): ThemeSettings {
@@ -377,7 +402,7 @@ export class ThemeConfiguration {
 			return ConfigurationTarget.WORKSPACE_FOLDER;
 		} else if (!types.isUndefined(settings.workspaceValue)) {
 			return ConfigurationTarget.WORKSPACE;
-		} else if (!types.isUndefined(settings.userRemote)) {
+		} else if (!types.isUndefined(settings.userRemoteValue)) {
 			return ConfigurationTarget.USER_REMOTE;
 		}
 		return ConfigurationTarget.USER;

@@ -6,9 +6,10 @@
 import { Sequencer } from '../../../base/common/async.js'; import { CancellationToken } from '../../../base/common/cancellation.js';
 import { Disposable } from '../../../base/common/lifecycle.js';
 import { ResourceMap } from '../../../base/common/map.js';
+import { waitForState } from '../../../base/common/observable.js';
 import { URI } from '../../../base/common/uri.js';
 import { GitRepository } from '../../contrib/git/browser/gitService.js';
-import { IGitExtensionDelegate, IGitService, GitRef, GitRefQuery, GitRefType, GitRepositoryState, GitBranch, GitChange, GitDiffChange, IGitRepository } from '../../contrib/git/common/gitService.js';
+import { IGitExtensionDelegate, IGitService, GitRef, GitRefQuery, GitRefType, GitRepositoryState, GitBranch, GitChange, GitDiffChange, IGitRepository, GitCommitOptions } from '../../contrib/git/common/gitService.js';
 import { extHostNamedCustomer, IExtHostContext } from '../../services/extensions/common/extHostCustomers.js';
 import { ExtHostContext, ExtHostGitExtensionShape, GitDiffChangeDto, GitRefTypeDto, GitRepositoryStateDto, MainContext, MainThreadGitExtensionShape } from '../common/extHost.protocol.js';
 
@@ -42,6 +43,7 @@ function toGitRepositoryState(dto: GitRepositoryStateDto | undefined): GitReposi
 			ahead: dto.HEAD.ahead,
 			behind: dto.HEAD.behind,
 		} satisfies GitBranch : undefined,
+		remotes: dto?.remotes ?? [],
 		mergeChanges: dto?.mergeChanges?.map(c => ({
 			uri: URI.revive(c.uri),
 			originalUri: c.originalUri ? URI.revive(c.originalUri) : undefined,
@@ -71,7 +73,7 @@ export class MainThreadGitExtensionService extends Disposable implements MainThr
 	private readonly _openRepositorySequencer = new Sequencer();
 
 	private _repositoryHandles = new ResourceMap<number>();
-	private _repositories = new Map<number, IGitRepository>();
+	private readonly _repositories = new Map<number, GitRepository>();
 
 	get repositories(): Iterable<IGitRepository> {
 		return this._repositories.values();
@@ -98,17 +100,10 @@ export class MainThreadGitExtensionService extends Disposable implements MainThr
 		}
 	}
 
-	private _getRepositoryByUri(uri: URI): IGitRepository | undefined {
-		const handle = this._repositoryHandles.get(uri);
-		return handle !== undefined ? this._repositories.get(handle) : undefined;
-	}
-
-	async openRepository(uri: URI): Promise<IGitRepository | undefined> {
+	async openRepository(uri: URI, token?: CancellationToken): Promise<IGitRepository | undefined> {
 		return this._openRepositorySequencer.queue(async () => {
-			// Check if we already have a repository for the given URI
-			const existingRepository = this._getRepositoryByUri(uri);
-			if (existingRepository) {
-				return existingRepository;
+			if (token?.isCancellationRequested) {
+				return undefined;
 			}
 
 			// Open the repository
@@ -119,18 +114,18 @@ export class MainThreadGitExtensionService extends Disposable implements MainThr
 
 			const repositoryRootUri = URI.revive(result.rootUri);
 
-			// Check if we already have a repository for the given root
-			const existingRepositoryForRoot = this._getRepositoryByUri(repositoryRootUri);
-			if (existingRepositoryForRoot) {
-				return existingRepositoryForRoot;
-			}
-
-			// Create a new repository and store it in the maps
 			const state = toGitRepositoryState(result.state);
-			const repository = new GitRepository(repositoryRootUri, state, this);
-
-			this._repositories.set(result.handle, repository);
+			let repository = this._repositories.get(result.handle);
+			if (repository) {
+				repository.updateState(state);
+			} else {
+				repository = new GitRepository(repositoryRootUri, state, this);
+				this._repositories.set(result.handle, repository);
+			}
 			this._repositoryHandles.set(repositoryRootUri, result.handle);
+
+			// Wait for the repository to be fully initialized before returning it
+			await waitForState(repository.state, state => state.HEAD !== undefined);
 
 			return repository;
 		});
@@ -172,6 +167,15 @@ export class MainThreadGitExtensionService extends Disposable implements MainThr
 
 		const result = await this._proxy.$diffBetweenWithStats2(handle, ref, path);
 		return result.map(toGitDiffChange);
+	}
+
+	async commitFiles(root: URI, files: readonly URI[], message: string, options?: GitCommitOptions): Promise<void> {
+		const handle = this._repositoryHandles.get(root);
+		if (handle === undefined) {
+			throw new Error(`Git repository is not open: ${root.toString()}`);
+		}
+
+		await this._proxy.$commitFiles(handle, [...files], message, options);
 	}
 
 	async $onDidChangeRepository(handle: number): Promise<void> {

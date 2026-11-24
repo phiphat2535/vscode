@@ -8,6 +8,7 @@
 		"allowJs": true,
 		"resolveJsonModule": true,
 		"isolatedModules": false,
+		"skipLibCheck": true,
 		"outDir": "../out/vs",
 		"types": [
 			"@webgpu/types",
@@ -15,7 +16,6 @@
 			"semver",
 			"sinon",
 			"trusted-types",
-			"winreg",
 			"wicg-file-system-access"
 		],
 		"plugins": [

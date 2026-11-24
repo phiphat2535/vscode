@@ -3,44 +3,68 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { Codicon } from '../../../../base/common/codicons.js';
+import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Emitter } from '../../../../base/common/event.js';
+import { IActionViewItemService } from '../../../../platform/actions/browser/actionViewItemService.js';
+import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../workbench/common/contributions.js';
+import { MenuItemAction, registerAction2, MenuRegistry } from '../../../../platform/actions/common/actions.js';
+import { Menus } from '../../../../workbench/contrib/sessions/browser/menus.js';
+import { AgentsWindowMenus } from '../../../browser/agentsWindowMenus.js';
+import { CHANGES_HEADER_ACTIONS_ID, ChangesActionsBarActionViewItem, SetChangesListViewModeAction, SetChangesTreeViewModeAction, VersionsPickerAction, ChangesDiffStatsAction, RevealCIChecksAction } from '../../../../workbench/contrib/sessionChanges/browser/changesView.js';
+// The changeset picker of the Changes editor's header, which the editor window registers too
+import { ChangesPickerActionViewItemContribution } from '../../../../workbench/contrib/sessionChanges/browser/changesPicker.js';
 import { localize2 } from '../../../../nls.js';
-import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
-import { Registry } from '../../../../platform/registry/common/platform.js';
-import { registerIcon } from '../../../../platform/theme/common/iconRegistry.js';
-import { registerWorkbenchContribution2, WorkbenchPhase } from '../../../../workbench/common/contributions.js';
-import { IViewContainersRegistry, ViewContainerLocation, IViewsRegistry, Extensions as ViewContainerExtensions, WindowVisibility } from '../../../../workbench/common/views.js';
-import { CHANGES_VIEW_CONTAINER_ID, CHANGES_VIEW_ID, ChangesViewPane, ChangesViewPaneContainer } from './changesView.js';
-import { ChangesTitleBarContribution } from './changesTitleBarWidget.js';
-import './changesViewActions.js';
-import './checksActions.js';
+import { NEW_FILE_TAB_COMMAND_ID } from '../../../../workbench/contrib/sessions/common/sessionCommands.js';
+import { EmptyFileEditorInput } from '../../../../workbench/contrib/sessions/browser/emptyFileEditorInput.js';
+import { OpenEditorCommandId } from '../../../../workbench/contrib/searchEditor/browser/constants.js';
+import { searchViewIcon } from '../../../../workbench/contrib/search/browser/searchIcons.js';
 
-const changesViewIcon = registerIcon('changes-view-icon', Codicon.gitCompare, localize2('changesViewIcon', 'View icon for the Changes view.').value);
+/** Registers the custom Changes actions bar of the session title bar. */
+class ChangesActionViewItemsContribution extends Disposable implements IWorkbenchContribution {
 
-const viewContainersRegistry = Registry.as<IViewContainersRegistry>(ViewContainerExtensions.ViewContainersRegistry);
+	static readonly ID = 'workbench.contrib.changesEditorHeader';
 
-const changesViewContainer = viewContainersRegistry.registerViewContainer({
-	id: CHANGES_VIEW_CONTAINER_ID,
-	title: localize2('changes', 'Changes'),
-	ctorDescriptor: new SyncDescriptor(ChangesViewPaneContainer),
-	icon: changesViewIcon,
-	order: 10,
-	hideIfEmpty: true,
-	windowVisibility: WindowVisibility.Sessions
-}, ViewContainerLocation.AuxiliaryBar, { doNotRegisterOpenCommand: true, isDefault: true });
+	constructor(
+		@IActionViewItemService actionViewItemService: IActionViewItemService,
+	) {
+		super();
 
-const viewsRegistry = Registry.as<IViewsRegistry>(ViewContainerExtensions.ViewsRegistry);
+		const onDidRegister = this._register(new Emitter<void>());
 
-viewsRegistry.registerViews([{
-	id: CHANGES_VIEW_ID,
-	name: localize2('changes', 'Changes'),
-	containerIcon: changesViewIcon,
-	ctorDescriptor: new SyncDescriptor(ChangesViewPane),
-	canToggleVisibility: true,
-	canMoveView: true,
-	weight: 100,
-	order: 1,
-	windowVisibility: WindowVisibility.Sessions
-}], changesViewContainer);
+		this._register(actionViewItemService.register(AgentsWindowMenus.TitleBarSessionMenu, CHANGES_HEADER_ACTIONS_ID, (action, options, instantiationService) => {
+			if (!(action instanceof MenuItemAction)) {
+				return undefined;
+			}
+			return instantiationService.createInstance(ChangesActionsBarActionViewItem, action, options);
+		}, onDidRegister.event));
 
-registerWorkbenchContribution2(ChangesTitleBarContribution.ID, ChangesTitleBarContribution, WorkbenchPhase.AfterRestored);
+		onDidRegister.fire();
+	}
+}
+
+registerWorkbenchContribution2(ChangesActionViewItemsContribution.ID, ChangesActionViewItemsContribution, WorkbenchPhase.BlockRestore);
+registerWorkbenchContribution2(ChangesPickerActionViewItemContribution.ID, ChangesPickerActionViewItemContribution, WorkbenchPhase.BlockRestore);
+registerAction2(VersionsPickerAction);
+registerAction2(SetChangesListViewModeAction);
+registerAction2(SetChangesTreeViewModeAction);
+registerAction2(ChangesDiffStatsAction);
+registerAction2(RevealCIChecksAction);
+
+MenuRegistry.appendMenuItems([
+	{
+		id: Menus.EmptyChangesActions,
+		item: {
+			command: { id: NEW_FILE_TAB_COMMAND_ID, title: localize2('changes.openFiles', "Open Files"), icon: EmptyFileEditorInput.ICON },
+			group: 'navigation',
+			order: 1,
+		},
+	},
+	{
+		id: Menus.EmptyChangesActions,
+		item: {
+			command: { id: OpenEditorCommandId, title: localize2('changes.searchFiles', "Search in Files"), icon: searchViewIcon },
+			group: 'navigation',
+			order: 2,
+		},
+	},
+]);

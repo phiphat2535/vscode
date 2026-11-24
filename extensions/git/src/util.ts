@@ -457,6 +457,28 @@ export class Limiter<T> {
 	}
 }
 
+/**
+ * Tracks in-flight operations so that callers can wait until
+ * all of them, including ones started while waiting, have finished.
+ */
+export class PendingOperations {
+
+	private readonly pending = new Set<Promise<unknown>>();
+
+	track<T>(operation: Promise<T>): Promise<T> {
+		this.pending.add(operation);
+		const done = () => this.pending.delete(operation);
+		operation.then(done, done);
+		return operation;
+	}
+
+	async settled(): Promise<void> {
+		while (this.pending.size > 0) {
+			await Promise.allSettled([...this.pending]);
+		}
+	}
+}
+
 type Completion<T> = { success: true; value: T } | { success: false; err: any };
 
 export class PromiseSource<T> {
@@ -868,5 +890,5 @@ export function getStashDescription(stash: Stash): string | undefined {
 }
 
 export function isCopilotWorktreeFolder(path: string): boolean {
-	return basename(path).startsWith('copilot-');
+	return basename(path).startsWith('copilot-') || basename(path).startsWith('agents-');
 }

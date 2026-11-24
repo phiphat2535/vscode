@@ -4,14 +4,99 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { RawContextKey } from '../../../../../platform/contextkey/common/contextkey.js';
+import { URI } from '../../../../../base/common/uri.js';
+import { IChatViewTitleActionContext, isChatViewTitleActionContext } from '../../common/actions/chatActions.js';
 import { AICustomizationManagementSection } from '../../common/aiCustomizationWorkspaceService.js';
+import { PromptsType } from '../../common/promptSyntax/promptTypes.js';
 import { localize } from '../../../../../nls.js';
 import { MenuId } from '../../../../../platform/actions/common/actions.js';
+import { hasReadableCustomizationContent } from '../../../../../platform/agentHost/common/agentHostCustomizationUri.js';
+import { CustomizationMigrationCategoryId } from './customizationMigrationCategories.js';
+import { ICustomizationMigrationHint } from '../../common/promptSyntax/service/customizationMigrationService.js';
+import type { IChatWidget } from '../chat.js';
+import { hasKey } from '../../../../../base/common/types.js';
+import { isPhoneLayout } from '../../../../browser/parts/sessions/mobileLayout.js';
+import { IWorkbenchLayoutService } from '../../../../services/layout/browser/layoutService.js';
 
 // Re-export for convenience — consumers import from this file
-export { AICustomizationManagementSection } from '../../common/aiCustomizationWorkspaceService.js';
-export type { AICustomizationPromptsStorage } from '../../common/aiCustomizationWorkspaceService.js';
+export { AICustomizationManagementCommands, AICustomizationManagementSection } from '../../common/aiCustomizationWorkspaceService.js';
+export type { AICustomizationSource } from '../../common/aiCustomizationWorkspaceService.js';
 export { BUILTIN_STORAGE } from '../../common/aiCustomizationWorkspaceService.js';
+
+export const DELETE_AI_CUSTOMIZATION_ID = 'aiCustomizationManagement.delete';
+
+export function assertAICustomizationManagementSupported(layoutService: IWorkbenchLayoutService): void {
+	if (isPhoneLayout(layoutService)) {
+		throw new Error(localize('customizationsUnavailableOnPhone', "Customization management is not available in the phone layout. Use a desktop window to manage customizations."));
+	}
+}
+
+export type AICustomizationManagementOpenEditorTarget =
+	| AICustomizationManagementSection
+	| { readonly widget: IChatWidget }
+	| {
+		readonly section?: AICustomizationManagementSection;
+		readonly sessionType?: string;
+		readonly sessionResource?: URI;
+		readonly revealUri?: URI;
+		readonly showDiscover?: boolean;
+		readonly showPluginMarketplaces?: boolean;
+		readonly searchQuery?: string;
+		readonly migration?: boolean;
+		readonly migrationCategory?: CustomizationMigrationCategoryId;
+		readonly migrationHint?: ICustomizationMigrationHint;
+	}
+	| IChatViewTitleActionContext;
+
+export function resolveAICustomizationManagementOpenEditorTarget(
+	target: AICustomizationManagementOpenEditorTarget | undefined,
+	pendingSessionType: string | undefined,
+	chatSessionResource: URI | undefined,
+	getSessionResourceForHarness: (sessionType: string) => URI,
+): { readonly section?: AICustomizationManagementSection; readonly revealUri?: URI; readonly sessionResource?: URI; readonly hasExplicitSessionResource: boolean; readonly showDiscover?: boolean; readonly showPluginMarketplaces?: boolean; readonly searchQuery?: string; readonly migration?: boolean; readonly migrationCategory?: CustomizationMigrationCategoryId; readonly migrationHint?: ICustomizationMigrationHint } {
+	if (target && typeof target === 'object' && hasKey(target, { widget: true })) {
+		const pendingTarget = target.widget.input.pendingDelegationTarget;
+		return {
+			sessionResource: pendingTarget ? getSessionResourceForHarness(pendingTarget) : target.widget.viewModel?.sessionResource,
+			hasExplicitSessionResource: true,
+		};
+	}
+	if (isChatViewTitleActionContext(target)) {
+		return { sessionResource: target.sessionResource, hasExplicitSessionResource: true };
+	}
+
+	const options = typeof target === 'string' ? { section: target } : target;
+	const sessionType = options?.sessionType ?? pendingSessionType;
+	const explicitSessionResource = options?.sessionResource;
+	return {
+		section: options?.section,
+		revealUri: options?.revealUri,
+		showDiscover: options?.showDiscover,
+		showPluginMarketplaces: options?.showPluginMarketplaces,
+		searchQuery: options?.searchQuery,
+		migration: options?.migration,
+		migrationCategory: options?.migrationCategory,
+		migrationHint: options?.migrationHint,
+		sessionResource: explicitSessionResource ?? (sessionType ? getSessionResourceForHarness(sessionType) : chatSessionResource),
+		hasExplicitSessionResource: explicitSessionResource !== undefined,
+	};
+}
+
+export function sectionToPromptType(section: AICustomizationManagementSection): PromptsType {
+	switch (section) {
+		case AICustomizationManagementSection.Agents:
+			return PromptsType.agent;
+		case AICustomizationManagementSection.Skills:
+			return PromptsType.skill;
+		case AICustomizationManagementSection.Instructions:
+			return PromptsType.instructions;
+		case AICustomizationManagementSection.Hooks:
+			return PromptsType.hook;
+		case AICustomizationManagementSection.Prompts:
+		default:
+			return PromptsType.prompt;
+	}
+}
 
 /**
  * Editor pane ID for the AI Customizations Management Editor.
@@ -24,24 +109,12 @@ export const AI_CUSTOMIZATION_MANAGEMENT_EDITOR_ID = 'workbench.editor.aiCustomi
 export const AI_CUSTOMIZATION_MANAGEMENT_EDITOR_INPUT_ID = 'workbench.input.aiCustomizationManagement';
 
 /**
- * Command IDs for the AI Customizations Management Editor.
- */
-export const AICustomizationManagementCommands = {
-	OpenEditor: 'aiCustomization.openManagementEditor',
-	CreateNewAgent: 'aiCustomization.createNewAgent',
-	CreateNewSkill: 'aiCustomization.createNewSkill',
-	CreateNewInstructions: 'aiCustomization.createNewInstructions',
-	CreateNewPrompt: 'aiCustomization.createNewPrompt',
-	GenerateDebugReport: 'aiCustomization.generateDebugReport',
-} as const;
-
-/**
  * Context key indicating the AI Customization Management Editor is focused.
  */
 export const CONTEXT_AI_CUSTOMIZATION_MANAGEMENT_EDITOR = new RawContextKey<boolean>(
 	'aiCustomizationManagementEditorFocused',
 	false,
-	localize('aiCustomizationManagementEditorFocused', "Whether the Chat Customizations editor is focused")
+	localize('aiCustomizationManagementEditorFocused', "Whether the Agent Customizations editor is focused")
 );
 
 /**
@@ -50,7 +123,7 @@ export const CONTEXT_AI_CUSTOMIZATION_MANAGEMENT_EDITOR = new RawContextKey<bool
 export const CONTEXT_AI_CUSTOMIZATION_MANAGEMENT_SECTION = new RawContextKey<string>(
 	'chatCustomizationSection',
 	AICustomizationManagementSection.Agents,
-	localize('chatCustomizationSection', "The currently selected section in the Chat Customizations editor")
+	localize('chatCustomizationSection', "The currently selected section in the Agent Customizations editor")
 );
 
 /**
@@ -60,7 +133,7 @@ export const CONTEXT_AI_CUSTOMIZATION_MANAGEMENT_SECTION = new RawContextKey<str
 export const CONTEXT_AI_CUSTOMIZATION_MANAGEMENT_HARNESS = new RawContextKey<string>(
 	'chatCustomizationSessionType',
 	'',
-	localize('chatCustomizationSessionType', "The active harness (session type) in the Chat Customizations editor")
+	localize('chatCustomizationSessionType', "The active harness (session type) in the Agent Customizations editor")
 );
 
 /**
@@ -72,6 +145,18 @@ export const AICustomizationManagementTitleMenuId = MenuId.for('AICustomizationM
  * Menu ID for the AI Customization Management Editor item context menu.
  */
 export const AICustomizationManagementItemMenuId = MenuId.for('AICustomizationManagementEditorItem');
+
+/**
+ * Internal-only menu for synthetic items that do not have source content.
+ * This is intentionally separate from the extension-contributable item menu.
+ */
+export const AICustomizationManagementSyntheticItemMenuId = MenuId.for('AICustomizationManagementEditorSyntheticItem');
+
+export function getAICustomizationManagementItemMenuId(uri: URI): MenuId {
+	return hasReadableCustomizationContent(uri)
+		? AICustomizationManagementItemMenuId
+		: AICustomizationManagementSyntheticItemMenuId;
+}
 
 /**
  * Menu ID for the AI Customization Management Editor create/add button.
@@ -99,6 +184,11 @@ export const AI_CUSTOMIZATION_ITEM_URI_KEY = 'aiCustomizationManagementItemUri';
  * Context key for the parent plugin URI, set when the item is provided by a plugin.
  */
 export const AI_CUSTOMIZATION_ITEM_PLUGIN_URI_KEY = 'aiCustomizationManagementItemPluginUri';
+
+/**
+ * Context key indicating whether the item's parent plugin is required by the organization and cannot be uninstalled.
+ */
+export const AI_CUSTOMIZATION_ITEM_PLUGIN_REQUIRED_KEY = 'aiCustomizationManagementItemPluginRequired';
 
 /**
  * Context key indicating whether the item is disabled.

@@ -9,8 +9,6 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use lazy_static::lazy_static;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -31,10 +29,6 @@ pub enum RequestedVersion {
 	Default,
 	Commit(String),
 	Path(String),
-}
-
-lazy_static! {
-	static ref COMMIT_RE: Regex = Regex::new(r"(?i)^[0-9a-f]{40}$").unwrap();
 }
 
 impl RequestedVersion {
@@ -79,7 +73,7 @@ impl TryFrom<&str> for RequestedVersion {
 			return Ok(RequestedVersion::Path(s.to_string()));
 		}
 
-		if COMMIT_RE.is_match(s) {
+		if s.len() == 40 && s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
 			return Ok(RequestedVersion::Commit(s.to_string()));
 		}
 
@@ -437,6 +431,30 @@ mod tests {
 		make_fake_vscode_install(&dir.path().join("desktop/stable"));
 		make_fake_vscode_install(&dir.path().join("desktop/1.68.2"));
 		dir
+	}
+
+	#[test]
+	fn test_commit_matching() {
+		for (value, expected) in [
+			("0123456789abcdefABCDEF0123456789abcdefAB".to_owned(), true),
+			("a".repeat(39), false),
+			("a".repeat(40), true),
+			("a".repeat(41), false),
+			(format!("{}g", "a".repeat(39)), false),
+			(format!("{}\n", "a".repeat(40)), false),
+			(format!("{}é", "a".repeat(38)), false),
+			("ａ".repeat(40), false),
+			(String::new(), false),
+		] {
+			assert_eq!(
+				matches!(
+					RequestedVersion::try_from(value.as_str()),
+					Ok(RequestedVersion::Commit(_))
+				),
+				expected,
+				"{value:?}"
+			);
+		}
 	}
 
 	#[test]

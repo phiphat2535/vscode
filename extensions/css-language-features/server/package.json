@@ -7,25 +7,23 @@
   "engines": {
     "node": "*"
   },
+  "type": "module",
   "main": "./out/node/cssServerMain",
   "browser": "./dist/browser/cssServerMain",
   "dependencies": {
     "@vscode/l10n": "^0.0.18",
-    "vscode-css-languageservice": "^6.3.10",
-    "vscode-languageserver": "^10.0.0-next.16",
-    "vscode-uri": "^3.1.0"
+    "vscode-css-languageservice": "^7.0.0-next.4",
+    "vscode-languageserver": "^11.0.0",
+    "vscode-uri": "^3.2.0"
   },
   "devDependencies": {
-    "@types/mocha": "^10.0.10",
-    "@types/node": "22.x"
+    "@types/node": "24.x",
+    "glob": "^14.0.6"
   },
   "scripts": {
     "compile": "gulp compile-extension:css-language-features-server",
     "watch": "gulp watch-extension:css-language-features-server",
-    "install-service-next": "npm install vscode-css-languageservice",
-    "install-service-local": "npm link vscode-css-languageservice",
-    "install-server-next": "npm install vscode-languageserver@next",
-    "install-server-local": "npm install vscode-languageserver",
+    "update-dependencies": "pnpm install vscode-languageserver@latest && pnpm install vscode-css-languageservice@next",
     "test": "node ./test/index.js"
   }
 }

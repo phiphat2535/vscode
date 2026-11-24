@@ -12,9 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use crate::util::http::{empty_body, full_body, HyperBody};
+use ::http::{Request, Response};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::{pin, time};
 
 use crate::async_pipe::{
@@ -29,7 +35,7 @@ use crate::tunnels::shutdown_signal::ShutdownRequest;
 use crate::update_service::{
 	unzip_downloaded_release, Platform, Release, TargetKind, UpdateService,
 };
-use crate::util::command::new_script_command;
+use crate::util::command::{kill_tree, new_script_command};
 use crate::util::errors::AnyError;
 use crate::util::http::{self, ReqwestSimpleHttp};
 use crate::util::io::SilentCopyProgress;
@@ -51,6 +57,9 @@ const SERVER_IDLE_TIMEOUT_SECS: u64 = 60 * 60;
 const SERVER_ACTIVE_TIMEOUT_SECS: u64 = SERVER_IDLE_TIMEOUT_SECS * 24 * 30 * 12;
 /// How long to cache the "latest" version we get from the update service.
 const RELEASE_CHECK_INTERVAL: u64 = 60 * 60;
+
+const CONNECTION_TOKEN_QUERY_NAME: &str = "tkn";
+const CONNECTION_TOKEN_COOKIE_NAME: &str = "vscode-tkn";
 
 /// Number of bytes for the secret keys. See workbench.ts for their usage.
 const SECRET_KEY_BYTES: usize = 32;
@@ -100,30 +109,33 @@ pub async fn serve_web(ctx: CommandContext, mut args: ServeWebArgs) -> Result<i3
 	}
 
 	let key = get_server_key_half(&ctx.paths);
-	let make_svc = move || {
-		let ctx = HandleContext {
-			cm: cm.clone(),
-			log: cm.log.clone(),
-			server_secret_key: key.clone(),
-		};
-		let service = service_fn(move |req| handle(ctx.clone(), req));
-		async move { Ok::<_, Infallible>(service) }
-	};
 
 	let mut shutdown = ShutdownRequest::create_rx([ShutdownRequest::CtrlC]);
-	let r = if let Some(s) = args.socket_path {
+	if let Some(s) = args.socket_path {
 		let s = PathBuf::from(&s);
-		let socket = listen_socket_rw_stream(&s).await?;
+		let mut socket = listen_socket_rw_stream(&s).await?;
 		ctx.log
 			.result(format!("Web UI available on {}", s.display()));
-		let r = Server::builder(socket.into_pollable())
-			.serve(make_service_fn(|_| make_svc()))
-			.with_graceful_shutdown(async {
-				let _ = shutdown.wait().await;
-			})
-			.await;
+		loop {
+			tokio::select! {
+				result = socket.accept() => {
+					let conn = match result {
+						Ok(c) => c,
+						Err(_) => continue,
+					};
+					let ctx = HandleContext { cm: cm.clone(), log: cm.log.clone(), server_secret_key: key.clone() };
+					tokio::spawn(async move {
+						let svc = service_fn(move |req| handle(ctx.clone(), req));
+						let _ = http1::Builder::new()
+							.serve_connection(TokioIo::new(conn), svc)
+							.with_upgrades()
+							.await;
+					});
+				}
+				_ = shutdown.wait() => break,
+			}
+		}
 		let _ = std::fs::remove_file(&s); // cleanup
-		r
 	} else {
 		let addr: SocketAddr = match &args.host {
 			Some(h) => {
@@ -131,10 +143,14 @@ pub async fn serve_web(ctx: CommandContext, mut args: ServeWebArgs) -> Result<i3
 			}
 			None => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port),
 		};
-		let builder = Server::try_bind(&addr).map_err(CodeError::CouldNotListenOnInterface)?;
+		let listener = TcpListener::bind(addr)
+			.await
+			.map_err(CodeError::CouldNotListenOnInterface)?;
 
 		// Get the actual bound address (important when port 0 is used for random port assignment)
-		let bound_addr = builder.local_addr();
+		let bound_addr = listener
+			.local_addr()
+			.map_err(CodeError::CouldNotListenOnInterface)?;
 		let mut listening = format!("Web UI available at http://{bound_addr}");
 		if let Some(base) = args.server_base_path {
 			if !base.starts_with('/') {
@@ -147,15 +163,26 @@ pub async fn serve_web(ctx: CommandContext, mut args: ServeWebArgs) -> Result<i3
 		}
 		ctx.log.result(listening);
 
-		builder
-			.serve(make_service_fn(|_| make_svc()))
-			.with_graceful_shutdown(async {
-				let _ = shutdown.wait().await;
-			})
-			.await
+		loop {
+			tokio::select! {
+				result = listener.accept() => {
+					let (stream, _) = match result {
+						Ok(r) => r,
+						Err(_) => continue,
+					};
+					let ctx = HandleContext { cm: cm.clone(), log: cm.log.clone(), server_secret_key: key.clone() };
+					tokio::spawn(async move {
+						let svc = service_fn(move |req| handle(ctx.clone(), req));
+						let _ = http1::Builder::new()
+							.serve_connection(TokioIo::new(stream), svc)
+							.with_upgrades()
+							.await;
+					});
+				}
+				_ = shutdown.wait() => break,
+			}
+		}
 	};
-
-	r.map_err(CodeError::CouldNotListenOnInterface)?;
 
 	Ok(0)
 }
@@ -168,11 +195,18 @@ struct HandleContext {
 }
 
 /// Handler function for an inbound request
-async fn handle(ctx: HandleContext, req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn handle(
+	ctx: HandleContext,
+	req: Request<Incoming>,
+) -> Result<Response<HyperBody>, Infallible> {
 	let client_key_half = get_client_key_half(&req);
 	let path = req.uri().path();
+	let is_authenticated =
+		request_has_valid_connection_token(&req, ctx.cm.args.connection_token.as_deref());
 
-	let mut res = if path.starts_with(&ctx.cm.base_path)
+	let mut res = if !is_authenticated {
+		response::forbidden()
+	} else if path.starts_with(&ctx.cm.base_path)
 		&& path.get(ctx.cm.base_path.len()..).unwrap_or_default() == SECRET_KEY_MINT_PATH
 	{
 		handle_secret_mint(&ctx, req)
@@ -181,11 +215,17 @@ async fn handle(ctx: HandleContext, req: Request<Body>) -> Result<Response<Body>
 	};
 
 	append_secret_headers(&ctx.cm.base_path, &mut res, &client_key_half);
+	append_frame_ancestors(&mut res);
+	if is_authenticated {
+		if let Some(connection_token) = &ctx.cm.args.connection_token {
+			append_connection_token_cookie(&mut res, connection_token);
+		}
+	}
 
 	Ok(res)
 }
 
-async fn handle_proxied(ctx: &HandleContext, req: Request<Body>) -> Response<Body> {
+async fn handle_proxied(ctx: &HandleContext, req: Request<Incoming>) -> Response<HyperBody> {
 	let release = if let Some((r, _)) = get_release_from_path(req.uri().path(), ctx.cm.platform) {
 		r
 	} else {
@@ -200,7 +240,7 @@ async fn handle_proxied(ctx: &HandleContext, req: Request<Body>) -> Response<Bod
 
 	match ctx.cm.get_connection(release).await {
 		Ok(rw) => {
-			if req.headers().contains_key(hyper::header::UPGRADE) {
+			if req.headers().contains_key(::http::header::UPGRADE) {
 				forward_ws_req_to_server(ctx.log.clone(), rw, req).await
 			} else {
 				forward_http_req_to_server(rw, req).await
@@ -211,7 +251,7 @@ async fn handle_proxied(ctx: &HandleContext, req: Request<Body>) -> Response<Bod
 	}
 }
 
-fn handle_secret_mint(ctx: &HandleContext, req: Request<Body>) -> Response<Body> {
+fn handle_secret_mint(ctx: &HandleContext, req: Request<Incoming>) -> Response<HyperBody> {
 	use sha2::{Digest, Sha256};
 
 	let mut hasher = Sha256::new();
@@ -227,18 +267,18 @@ fn handle_secret_mint(ctx: &HandleContext, req: Request<Body>) -> Response<Body>
 /// and maintains the http-only cookie the client will use for cookies.
 fn append_secret_headers(
 	base_path: &str,
-	res: &mut Response<Body>,
+	res: &mut Response<HyperBody>,
 	client_key_half: &SecretKeyPart,
 ) {
 	let headers = res.headers_mut();
 	headers.append(
-		hyper::header::SET_COOKIE,
+		::http::header::SET_COOKIE,
 		format!("{PATH_COOKIE_NAME}={base_path}{SECRET_KEY_MINT_PATH}; SameSite=Strict; Path=/",)
 			.parse()
 			.unwrap(),
 	);
 	headers.append(
-		hyper::header::SET_COOKIE,
+		::http::header::SET_COOKIE,
 		format!(
 			"{}={}; SameSite=Strict; HttpOnly; Max-Age=2592000; Path=/",
 			SECRET_KEY_COOKIE_NAME,
@@ -247,6 +287,61 @@ fn append_secret_headers(
 		.parse()
 		.unwrap(),
 	);
+}
+
+/// Prevents other origins from embedding serve-web pages. Same-origin iframes
+/// used by the workbench itself are still allowed.
+fn append_frame_ancestors(res: &mut Response<HyperBody>) {
+	let headers = res.headers_mut();
+	headers.append(
+		::http::header::CONTENT_SECURITY_POLICY,
+		"frame-ancestors 'self'".parse().unwrap(),
+	);
+	headers.insert(
+		::http::header::HeaderName::from_static("x-frame-options"),
+		"SAMEORIGIN".parse().unwrap(),
+	);
+}
+
+fn append_connection_token_cookie(res: &mut Response<HyperBody>, connection_token: &str) {
+	res.headers_mut().append(
+		::http::header::SET_COOKIE,
+		format!(
+			"{CONNECTION_TOKEN_COOKIE_NAME}={connection_token}; SameSite=Strict; Max-Age=2592000; Path=/"
+		)
+		.parse()
+		.unwrap(),
+	);
+}
+
+fn request_has_valid_connection_token<B>(
+	req: &Request<B>,
+	expected_connection_token: Option<&str>,
+) -> bool {
+	let Some(expected_connection_token) = expected_connection_token else {
+		return true;
+	};
+
+	let query = req.uri().query().unwrap_or_default();
+	let mut query_tokens = url::form_urlencoded::parse(query.as_bytes())
+		.filter(|(name, _)| name == CONNECTION_TOKEN_QUERY_NAME);
+	if let Some((_, query_token)) = query_tokens.next() {
+		if query_tokens.next().is_none() && query_token == expected_connection_token {
+			return true;
+		}
+	}
+
+	if req
+		.headers()
+		.get("sec-fetch-site")
+		.and_then(|value| value.to_str().ok())
+		.is_some_and(|site| site == "cross-site" || site == "same-site")
+	{
+		return false;
+	}
+
+	extract_cookie(req, CONNECTION_TOKEN_COOKIE_NAME)
+		.is_some_and(|connection_token| connection_token == expected_connection_token)
 }
 
 /// Gets the release info from the VS Code path prefix, which is in the
@@ -284,20 +379,20 @@ fn get_release_from_path(path: &str, platform: Platform) -> Option<(Release, Str
 /// Proxies the standard HTTP request to the async pipe, returning the piped response
 async fn forward_http_req_to_server(
 	(rw, handle): (AsyncPipe, ConnectionHandle),
-	req: Request<Body>,
-) -> Response<Body> {
+	req: Request<Incoming>,
+) -> Response<HyperBody> {
 	let (mut request_sender, connection) =
-		match hyper::client::conn::Builder::new().handshake(rw).await {
+		match hyper::client::conn::http1::handshake(TokioIo::new(rw)).await {
 			Ok(r) => r,
 			Err(e) => return response::connection_err(e),
 		};
 
 	tokio::spawn(connection);
 
-	let res = request_sender
-		.send_request(req)
-		.await
-		.unwrap_or_else(response::connection_err);
+	let res = match request_sender.send_request(req).await {
+		Ok(res) => res.map(|b| b.boxed()),
+		Err(e) => response::connection_err(e),
+	};
 
 	// technically, we should buffer the body into memory since it may not be
 	// read at this point, but because the keepalive time is very large
@@ -312,35 +407,44 @@ async fn forward_http_req_to_server(
 async fn forward_ws_req_to_server(
 	log: log::Logger,
 	(rw, handle): (AsyncPipe, ConnectionHandle),
-	mut req: Request<Body>,
-) -> Response<Body> {
+	mut req: Request<Incoming>,
+) -> Response<HyperBody> {
 	// splicing of client and servers inspired by https://github.com/hyperium/hyper/blob/fece9f7f50431cf9533cfe7106b53a77b48db699/examples/upgrades.rs
 	let (mut request_sender, connection) =
-		match hyper::client::conn::Builder::new().handshake(rw).await {
+		match hyper::client::conn::http1::handshake(TokioIo::new(rw)).await {
 			Ok(r) => r,
 			Err(e) => return response::connection_err(e),
 		};
 
-	tokio::spawn(connection);
+	// `.with_upgrades()` is required so that `hyper::upgrade::on` can later
+	// take over the connection for websocket traffic.
+	tokio::spawn(connection.with_upgrades());
 
 	let mut proxied_req = Request::builder().uri(req.uri());
 	for (k, v) in req.headers() {
 		proxied_req = proxied_req.header(k, v);
 	}
 
-	let mut res = request_sender
-		.send_request(proxied_req.body(Body::empty()).unwrap())
+	let mut res = match request_sender
+		.send_request(
+			proxied_req
+				.body(http_body_util::Empty::<bytes::Bytes>::new())
+				.unwrap(),
+		)
 		.await
-		.unwrap_or_else(response::connection_err);
+	{
+		Ok(r) => r,
+		Err(e) => return response::connection_err(e),
+	};
 
-	let mut proxied_res = Response::new(Body::empty());
+	let mut proxied_res = Response::new(empty_body());
 	*proxied_res.status_mut() = res.status();
 	for (k, v) in res.headers() {
 		proxied_res.headers_mut().insert(k, v.clone());
 	}
 
 	// only start upgrade at this point in case the server decides to deny socket
-	if res.status() == hyper::StatusCode::SWITCHING_PROTOCOLS {
+	if res.status() == ::http::StatusCode::SWITCHING_PROTOCOLS {
 		tokio::spawn(async move {
 			let (s_req, s_res) =
 				tokio::join!(hyper::upgrade::on(&mut req), hyper::upgrade::on(&mut res));
@@ -352,8 +456,10 @@ async fn forward_ws_req_to_server(
 				),
 				(Err(e1), _) => debug!(log, "client ({}) websocket upgrade failed", e1),
 				(_, Err(e2)) => debug!(log, "server ({}) websocket upgrade failed", e2),
-				(Ok(mut s_req), Ok(mut s_res)) => {
+				(Ok(s_req), Ok(s_res)) => {
 					trace!(log, "websocket upgrade succeeded");
+					let mut s_req = TokioIo::new(s_req);
+					let mut s_res = TokioIo::new(s_res);
 					let r = tokio::io::copy_bidirectional(&mut s_req, &mut s_res).await;
 					trace!(log, "websocket closed (error: {:?})", r.err());
 				}
@@ -372,10 +478,10 @@ fn is_commit_hash(s: &str) -> bool {
 }
 
 /// Gets a cookie from the request by name.
-fn extract_cookie(req: &Request<Body>, name: &str) -> Option<String> {
-	for h in req.headers().get_all(hyper::header::COOKIE) {
+fn extract_cookie<B>(req: &Request<B>, name: &str) -> Option<String> {
+	for h in req.headers().get_all(::http::header::COOKIE) {
 		if let Ok(str) = h.to_str() {
-			for pair in str.split("; ") {
+			for pair in str.split(';').map(str::trim) {
 				let i = match pair.find('=') {
 					Some(i) => i,
 					None => continue,
@@ -432,7 +538,7 @@ fn get_server_key_half(paths: &LauncherPaths) -> SecretKeyPart {
 }
 
 /// Gets the client's half of the secret key.
-fn get_client_key_half(req: &Request<Body>) -> SecretKeyPart {
+fn get_client_key_half(req: &Request<Incoming>) -> SecretKeyPart {
 	if let Some(c) = extract_cookie(req, SECRET_KEY_COOKIE_NAME) {
 		if let Ok(sk) = SecretKeyPart::decode(&c) {
 			return sk;
@@ -450,33 +556,41 @@ mod response {
 
 	use super::*;
 
-	pub fn connection_err(err: hyper::Error) -> Response<Body> {
+	pub fn connection_err(err: hyper::Error) -> Response<HyperBody> {
 		Response::builder()
 			.status(503)
-			.body(Body::from(format!("Error connecting to server: {err:?}")))
+			.body(full_body(format!("Error connecting to server: {err:?}")))
 			.unwrap()
 	}
 
-	pub fn code_err(err: CodeError) -> Response<Body> {
+	pub fn code_err(err: CodeError) -> Response<HyperBody> {
 		Response::builder()
 			.status(500)
-			.body(Body::from(format!("Error serving request: {err}")))
+			.body(full_body(format!("Error serving request: {err}")))
 			.unwrap()
 	}
 
-	pub fn wait_for_download() -> Response<Body> {
+	pub fn wait_for_download() -> Response<HyperBody> {
 		Response::builder()
 			.status(202)
 			.header("Content-Type", "text/html") // todo: get latest
-			.body(Body::from(concatcp!("The latest version of the ", QUALITYLESS_SERVER_NAME, " is downloading, please wait a moment...<script>setTimeout(()=>location.reload(),1500)</script>", )))
+			.body(full_body(concatcp!("The latest version of the ", QUALITYLESS_SERVER_NAME, " is downloading, please wait a moment...<script>setTimeout(()=>location.reload(),1500)</script>", )))
 			.unwrap()
 	}
 
-	pub fn secret_key(hash: Vec<u8>) -> Response<Body> {
+	pub fn secret_key(hash: Vec<u8>) -> Response<HyperBody> {
 		Response::builder()
 			.status(200)
 			.header("Content-Type", "application/octet-stream") // todo: get latest
-			.body(Body::from(hash))
+			.body(full_body(hash))
+			.unwrap()
+	}
+
+	pub fn forbidden() -> Response<HyperBody> {
+		Response::builder()
+			.status(403)
+			.header("Content-Type", "text/plain")
+			.body(full_body("Forbidden: missing or invalid connection token"))
 			.unwrap()
 	}
 }
@@ -520,6 +634,9 @@ struct ConnectionManager {
 	pub platform: Platform,
 	pub log: log::Logger,
 	args: ServeWebArgs,
+	/// Extension IDs for which to enable proposed API, forwarded from the
+	/// global `--enable-proposed-api` flag to the server subprocess.
+	enable_proposed_api: Vec<String>,
 	/// Server base path, ending in `/`
 	base_path: String,
 	/// Cache where servers are stored
@@ -576,6 +693,7 @@ impl ConnectionManager {
 		Arc::new(Self {
 			platform,
 			args,
+			enable_proposed_api: ctx.args.editor_options.enable_proposed_api.clone(),
 			base_path,
 			log: ctx.log.clone(),
 			cache,
@@ -634,7 +752,7 @@ impl ConnectionManager {
 		let target_kind = TargetKind::Web;
 
 		let quality = VSCODE_CLI_QUALITY
-			.ok_or_else(|| CodeError::UpdatesNotConfigured("no configured quality"))
+			.ok_or(CodeError::UpdatesNotConfigured("no configured quality"))
 			.and_then(|q| {
 				Quality::try_from(q).map_err(|_| CodeError::UpdatesNotConfigured("unknown quality"))
 			})?;
@@ -708,6 +826,7 @@ impl ConnectionManager {
 		let state_map_dup = self.state.clone();
 		let args = StartArgs {
 			args: self.args.clone(),
+			enable_proposed_api: self.enable_proposed_api.clone(),
 			log: self.log.clone(),
 			opener,
 			release,
@@ -824,6 +943,9 @@ impl ConnectionManager {
 		if args.args.disable_telemetry {
 			cmd.arg("--disable-telemetry");
 		}
+		for ext_id in &args.enable_proposed_api {
+			cmd.arg(format!("--enable-proposed-api={ext_id}"));
+		}
 
 		// removed, otherwise the workbench will not be usable when running the CLI from sources.
 		cmd.env_remove("VSCODE_DEV");
@@ -877,7 +999,22 @@ impl ConnectionManager {
 				}
 				_ = &mut kill_timer => {
 					info!(args.log, "[{} process]: idle timeout reached, ending", commit_prefix);
-					let _ = child.kill().await;
+					// The entrypoint is a shell/cmd shim, so kill the full tree
+					// to avoid orphaning the Node server it launches.
+					if let Some(pid) = child.id() {
+						let _ = kill_tree(pid).await;
+					}
+					const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+					if tokio::time::timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+						warning!(
+							args.log,
+							"[{} process]: server did not exit within {}s after kill_tree; escalating to force kill",
+							commit_prefix,
+							REAP_TIMEOUT.as_secs()
+						);
+						let _ = child.kill().await;
+						let _ = child.wait().await;
+					}
 					break;
 				}
 				e = child.wait() => {
@@ -892,6 +1029,7 @@ impl ConnectionManager {
 struct StartArgs {
 	log: log::Logger,
 	args: ServeWebArgs,
+	enable_proposed_api: Vec<String>,
 	release: Release,
 	opener: BarrierOpener<Result<StartData, String>>,
 }
@@ -921,4 +1059,69 @@ fn mint_connection_token(path: &Path, prefer_token: Option<String>) -> std::io::
 	let prefer_token = prefer_token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 	f.write_all(prefer_token.as_bytes())?;
 	Ok(prefer_token)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn request(
+		uri: &str,
+		connection_token: Option<&str>,
+		sec_fetch_site: Option<&str>,
+	) -> Request<()> {
+		let mut builder = Request::builder().uri(uri);
+		if let Some(connection_token) = connection_token {
+			builder = builder.header(
+				::http::header::COOKIE,
+				format!("{CONNECTION_TOKEN_COOKIE_NAME}={connection_token}"),
+			);
+		}
+		if let Some(sec_fetch_site) = sec_fetch_site {
+			builder = builder.header("sec-fetch-site", sec_fetch_site);
+		}
+		builder.body(()).unwrap()
+	}
+
+	#[test]
+	fn authenticates_connection_tokens_before_routing() {
+		assert!(request_has_valid_connection_token(
+			&request("/?tkn=expected", None, Some("cross-site")),
+			Some("expected")
+		));
+		assert!(request_has_valid_connection_token(
+			&request("/", Some("expected"), Some("same-origin")),
+			Some("expected")
+		));
+		assert!(request_has_valid_connection_token(
+			&request("/", None, None),
+			None
+		));
+		assert!(!request_has_valid_connection_token(
+			&request("/", Some("unexpected"), Some("same-origin")),
+			Some("expected")
+		));
+		assert!(!request_has_valid_connection_token(
+			&request("/", None, Some("same-origin")),
+			Some("expected")
+		));
+	}
+
+	#[test]
+	fn rejects_cross_site_cookie_authentication() {
+		for sec_fetch_site in ["cross-site", "same-site"] {
+			assert!(!request_has_valid_connection_token(
+				&request("/", Some("expected"), Some(sec_fetch_site)),
+				Some("expected")
+			));
+		}
+	}
+
+	#[test]
+	fn rejects_duplicate_connection_token_queries() {
+		assert!(!request_has_valid_connection_token(
+			&request("/?tkn=expected&tkn=expected", None, None),
+			Some("expected")
+		));
+	}
 }
